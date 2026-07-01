@@ -1,0 +1,39 @@
+{
+  "name": "material-designer-runtime",
+  "version": "0.1.0",
+  "description": "Lightweight runtime for loading and rendering Material Designer node graph documents.",
+  "type": "module",
+  "license": "MIT",
+  "main": "./dist/index.js",
+  "module": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js"
+    }
+  },
+  "files": [
+    "dist",
+    "README.md",
+    "LICENSE"
+  ],
+  "sideEffects": [
+    "./dist/index.js"
+  ],
+  "scripts": {
+    "build": "vite build && tsc -p tsconfig.build.json",
+    "pack:dry-run": "npm pack --dry-run",
+    "test": "vitest run",
+    "prepublishOnly": "npm run test && npm run build && npm run pack:dry-run"
+  },
+  "peerDependencies": {
+    "three": "0.184.0"
+  },
+  "devDependencies": {
+    "@types/three": "^0.184.1",
+    "typescript": "6.0.3",
+    "vite": "8.0.16",
+    "vitest": "^4.0.0"
+  }
+}
