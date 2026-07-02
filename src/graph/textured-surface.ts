@@ -269,18 +269,17 @@ export class TexturedSurface {
   private async rebuild(): Promise<void> {
     try {
       if (this.backend === "offline" && this.service.hasRenderer) {
-        // Honour the authored output resolution: if it changed, bake into a NEW set at the new size. A
-        // pending "Regenerate" (flushRequested) forces a new set regardless of size — flushing every cache.
-        // Keep the OLD set alive until after the rewire below, so no frame rendered during the bake samples a
-        // disposed texture (the offline material still points at the old textures until wire() swaps them).
+        // Re-bake into the SAME texture set — never swap it out. The live surface material keeps sampling
+        // these exact THREE.Texture objects, so nothing it has bound is ever destroyed mid-render (which the
+        // WebGPU backend rejects: "Destroyed texture used in a submit"). "Regenerate" flushes the caches +
+        // bake materials in place; an output-resolution change resizes the targets in place. Both keep the
+        // texture objects, so no rewire/rebind is needed either.
         const size = this.surfaceBakeSize();
-        const flush = this.flushRequested;
-        this.flushRequested = false;
-        const oldSet = flush || size !== this.set.size ? this.set : null;
-        if (oldSet) {
-          this.set = this.service.createTextureSet(SURFACE_CHANNELS, size);
-          this.wiredOnce = false;
+        if (this.flushRequested) {
+          this.flushRequested = false;
+          this.set.flushCaches();
         }
+        this.set.resize(size);
         const soloNodeId = this.graph.soloNode ?? undefined;
         const t0 = performance.now();
         const changed = await this.service.bakeInto(this.set, this.graph, {
@@ -294,7 +293,6 @@ export class TexturedSurface {
           this.wiredOnce = true;
         }
         this.material_ = this.offlineMat;
-        oldSet?.dispose(); // safe now: the material has been rewired to the new set's textures
       } else {
         this.material_ = this.buildLive();
       }

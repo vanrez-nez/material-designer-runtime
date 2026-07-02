@@ -150,10 +150,26 @@ export class BakedTextureSet {
   present = new Set<PbrSocket>();
   signature = "";
 
+  size: number;
+
   constructor(
-    readonly size: number,
+    size: number,
     readonly channels: PbrSocket[],
-  ) {}
+  ) {
+    this.size = size;
+  }
+
+  // Resize every channel/height target IN PLACE, preserving the THREE.Texture objects the live surface
+  // samples (RenderTarget.setSize swaps the underlying GPU texture but keeps the wrapper), then flush the
+  // size-dependent caches. Used instead of allocating a new set on an output-resolution change, so nothing
+  // the render loop has bound is destroyed. No-op when the size is unchanged.
+  resize(size: number): void {
+    if (size === this.size) return;
+    this.size = size;
+    for (const rt of this.targets.values()) rt.setSize(size, size);
+    this.heightTarget?.setSize(size, size);
+    this.flushCaches();
+  }
 
   target(ch: PbrSocket): RenderTarget {
     let rt = this.targets.get(ch);
@@ -226,6 +242,22 @@ export class BakedTextureSet {
   // The baked texture for a channel (null if never baked). Surfaces sample these.
   texture(ch: PbrSocket): THREE.Texture | null {
     return this.targets.get(ch)?.texture ?? null;
+  }
+
+  // Flush intermediate GPU caches and force a full channel recompile on the next bake, WITHOUT touching the
+  // channel/height TARGET textures the live surface samples. Destroying a target the render loop still has
+  // bound is a WebGPU error ("Destroyed texture used in a submit"), so "Regenerate" re-bakes into the same
+  // targets in place instead of swapping the set. The bake materials here are internal to baking (never on
+  // the mesh), so disposing them is safe and makes the next bake rebuild them from scratch.
+  flushCaches(): void {
+    for (const m of this.mats.values()) m.dispose();
+    this.mats.clear();
+    for (const rt of this.cacheTargets.values()) rt.dispose();
+    this.cacheTargets.clear();
+    for (const m of this.cacheMats.values()) m.dispose();
+    this.cacheMats.clear();
+    this.cachePlan = [];
+    this.uniforms = new Map();
   }
 
   dispose(): void {
