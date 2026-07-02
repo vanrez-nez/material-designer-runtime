@@ -96,6 +96,7 @@ export type MaterialBackend = "live" | "offline";
 
 export type GraphChange =
   | { kind: "structural" }
+  | { kind: "layout" }
   | {
       kind: "param";
       nodeId: string;

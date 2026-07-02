@@ -158,6 +158,10 @@ export class TexturedSurface {
 
   // --- reacting to graph edits -------------------------------------------------------------------
   private onGraphChange(change: GraphChange): void {
+    if (change.kind === "layout") {
+      return;
+    }
+
     if (change.kind === "param") {
       // Live backend: float/colour/vec3/curve params are live uniforms — update in place, no re-bake.
       if (this.backend === "live") {
