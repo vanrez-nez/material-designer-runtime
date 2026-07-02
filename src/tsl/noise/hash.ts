@@ -1,7 +1,7 @@
 import { Fn, float, int, vec2, vec3, floor } from "three/tsl";
 import type { MaterialValue } from "../../graph/types";
 
-// Shared integer hashes for the noise library (src/scene/material/tsl/noise/). The PERIODIC noise variants
+// Shared integer hashes for the noise library. The PERIODIC noise variants
 // must hash the wrapped integer CELL INDEX (mod period), not floatBitsToUint of the float coordinate — only
 // the former can tile. This is the same PCG3D integer hash used by the Voronoi port (blender-voronoi.ts);
 // kept here as the single home for the noise-lib so those files don't reach into Voronoi internals.

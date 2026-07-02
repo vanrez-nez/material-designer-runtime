@@ -165,7 +165,7 @@ export interface GraphNode {
   id: string;
   type: string;
   params: Record<string, unknown>;
-  position: { x: number; y: number };
+  position?: { x: number; y: number };
   enabled: boolean;
   // Optional user-facing name; overrides the registry def.label in the editor (title + breadcrumb).
   // Cosmetic only — the compiler ignores it, so renames never recompile. Additive/optional: documents
@@ -195,6 +195,28 @@ export interface MaterialGraphDocument {
   version: number;
   nodes: GraphNode[];
   edges: GraphEdge[];
+  metadata?: MaterialGraphDocumentMetadata;
+  ui?: MaterialGraphDocumentUiState;
+}
+
+export interface MaterialGraphDocumentMetadata {
+  title?: string;
+}
+
+export interface MaterialGraphEditorViewState {
+  layoutArrangement?: "down" | "right" | "up" | "left";
+  transform?: { k: number; x: number; y: number };
+}
+
+export interface MaterialGraphEditorUiState {
+  activeGroupPath?: string[];
+  soloNode?: string | null;
+  view?: MaterialGraphEditorViewState;
+}
+
+export interface MaterialGraphDocumentUiState {
+  editor?: MaterialGraphEditorUiState;
+  settings?: Record<string, unknown>;
 }
 
 export interface MaterialGraphSource {
