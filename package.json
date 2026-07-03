@@ -4,6 +4,30 @@
   "description": "Lightweight runtime for loading and rendering Material Designer node graph documents.",
   "type": "module",
   "license": "MIT",
+  "author": "Ivan Juarez",
+  "homepage": "https://github.com/vanrez-nez/material-designer-runtime#readme",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/vanrez-nez/material-designer-runtime.git"
+  },
+  "bugs": {
+    "url": "https://github.com/vanrez-nez/material-designer-runtime/issues"
+  },
+  "keywords": [
+    "three",
+    "threejs",
+    "webgpu",
+    "tsl",
+    "material",
+    "pbr",
+    "node-graph",
+    "procedural",
+    "textures",
+    "shader"
+  ],
+  "engines": {
+    "node": ">=18"
+  },
   "main": "./dist/index.js",
   "module": "./dist/index.js",
   "types": "./dist/index.d.ts",

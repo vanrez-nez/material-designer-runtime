@@ -2,6 +2,17 @@
 
 Lightweight runtime for loading Material Designer node graph documents and applying them to Three.js meshes.
 
+## Install
+
+```sh
+npm install material-designer-runtime three@0.184.0
+```
+
+`three` is a peer dependency — this package uses its WebGPU renderer and TSL, so install the exact
+supported version alongside it.
+
+## Usage
+
 ```ts
 import { MaterialGraphRuntime } from "material-designer-runtime";
 
