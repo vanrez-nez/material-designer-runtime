@@ -31,6 +31,18 @@ export class MaterialGraphRuntime {
     return this.surface.lastError ?? this.graph.lastError;
   }
 
+  // True while a bake is in flight (covers the whole rebuild, incl. the in-place texture resize). Gate a
+  // render loop on `!runtime.busy` so it never submits a frame mid-bake.
+  get busy(): boolean {
+    return this.surface.busy;
+  }
+
+  // Resolves once the runtime is done baking (immediately when idle). Useful after edits that trigger an
+  // implicit re-bake (setNodeParam / setOutputResolution) where there's no explicit refresh() to await.
+  whenIdle(): Promise<void> {
+    return this.surface.whenIdle();
+  }
+
   setRenderer(renderer: WebGPURenderer): this {
     this.service.attachRenderer(renderer);
     return this;

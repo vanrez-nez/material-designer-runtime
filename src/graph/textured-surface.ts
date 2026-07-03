@@ -62,6 +62,11 @@ export class TexturedSurface {
   private flushRequested = false;
   private readonly listeners = new Set<() => void>();
   private lastError_: string | null = null;
+  // Processing lifecycle: `busy` is true while a bake / re-render is in flight — including the in-place
+  // texture resize at the start of a rebuild. Consumers gate their render loop on it, since rendering
+  // during a rebuild submits a texture being resized/recreated ("Destroyed texture used in a submit").
+  private processingDepth = 0;
+  private idleWaiters: Array<() => void> = [];
 
   constructor(
     private readonly graph: MaterialGraphSource,
@@ -84,6 +89,30 @@ export class TexturedSurface {
 
   get lastError(): string | null {
     return this.lastError_;
+  }
+
+  // True while a bake / re-render is in flight (see the processing lifecycle above). Consumers should
+  // skip rendering while busy to avoid submitting a texture that's being resized/recreated.
+  get busy(): boolean {
+    return this.processingDepth > 0;
+  }
+
+  // Resolves once no bake / re-render is in flight (immediately when already idle).
+  whenIdle(): Promise<void> {
+    if (this.processingDepth === 0) return Promise.resolve();
+    return new Promise((resolve) => this.idleWaiters.push(resolve));
+  }
+
+  private enterProcessing(): void {
+    this.processingDepth += 1;
+  }
+  private exitProcessing(): void {
+    this.processingDepth -= 1;
+    if (this.processingDepth === 0) {
+      const waiters = this.idleWaiters;
+      this.idleWaiters = [];
+      for (const resolve of waiters) resolve();
+    }
   }
 
   // ms of the last offline texture re-bake (0 in the live backend, which has no bake step).
@@ -249,12 +278,15 @@ export class TexturedSurface {
   // no `notify()` needed (and skipping it avoids kicking off a preview re-bake on every drag tick).
   private async rerenderOffline(): Promise<void> {
     if (this.backend !== "offline" || !this.service.hasRenderer) return;
+    this.enterProcessing();
     try {
       await this.service.rerenderInto(this.set, this.source);
       this.lastError_ = this.graph.lastError;
     } catch (err) {
       this.lastError_ = err instanceof Error ? err.message : String(err);
       console.warn("[textured-surface] re-render failed:", this.lastError_);
+    } finally {
+      this.exitProcessing();
     }
   }
 
@@ -267,7 +299,9 @@ export class TexturedSurface {
   // Re-derive the presented material. Offline (with a renderer): bake the graph into the texture set via the
   // service, rewire on a channel-set change. Otherwise: compile the procedural live material.
   private async rebuild(): Promise<void> {
+    this.enterProcessing();
     try {
+      try {
       if (this.backend === "offline" && this.service.hasRenderer) {
         // Re-bake into the SAME texture set — never swap it out. The live surface material keeps sampling
         // these exact THREE.Texture objects, so nothing it has bound is ever destroyed mid-render (which the
@@ -297,11 +331,14 @@ export class TexturedSurface {
         this.material_ = this.buildLive();
       }
       this.lastError_ = this.graph.lastError;
-    } catch (err) {
-      this.lastError_ = err instanceof Error ? err.message : String(err);
-      console.warn("[textured-surface] rebuild failed:", this.lastError_);
+      } catch (err) {
+        this.lastError_ = err instanceof Error ? err.message : String(err);
+        console.warn("[textured-surface] rebuild failed:", this.lastError_);
+      }
+      this.notify();
+    } finally {
+      this.exitProcessing();
     }
-    this.notify();
   }
 
   // Compile the procedural live material (used as a startup fallback and the "live" backend).
