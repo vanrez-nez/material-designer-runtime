@@ -1,6 +1,6 @@
 import { QuadMesh, RenderTarget, MeshBasicNodeMaterial, type WebGPURenderer } from "three/webgpu";
-import { NoColorSpace, NearestFilter, RepeatWrapping, Scene, OrthographicCamera } from "three";
-import { vec3, vec2, sRGBTransferOETF, texture, uniform, uv, normalize } from "three/tsl";
+import { NoColorSpace, NearestFilter, RepeatWrapping, Scene, OrthographicCamera, type Texture } from "three";
+import { vec3, vec2, sRGBTransferOETF, texture, uv, normalize } from "three/tsl";
 import type { MaterialValue, PbrSocket } from "./types";
 
 // Colour-management convention (plan L5 / Phase 6): the graph works in LINEAR space, and a baked texture
@@ -36,35 +36,57 @@ const bakeQuad = new QuadMesh(new MeshBasicNodeMaterial());
 // That path recompiles per call, which is fine for non-interactive one-offs.
 const scratchMat = new MeshBasicNodeMaterial();
 
-// Raw high-res intermediate: stores the already-encoded channel values verbatim (no colorspace / filtering
-// so the box taps read exact texels). Resized in place so the prebuilt downsample nodes keep referencing it.
-const ssRT = new RenderTarget(SS, SS);
-ssRT.texture.colorSpace = NoColorSpace;
-ssRT.texture.minFilter = ssRT.texture.magFilter = NearestFilter;
-ssRT.texture.wrapS = ssRT.texture.wrapT = RepeatWrapping; // box taps at tile edges wrap, not clamp
-const ssTexel = uniform(vec2(1 / SS, 1 / SS)); // 1 / high-res size, set per bake
-
 // Box filter: average the SS×SS high-res texels covering each destination texel. The normal channel must
 // average decoded vectors (raw encoded [0,1] normals don't average linearly), then renormalize + re-encode.
-function downsampleNode(isNormal: boolean): MaterialValue {
+// `ssTexel` (1 / high-res size) is a build-time constant baked into the node — each pooled size gets its own.
+function downsampleNode(ssTex: Texture, ssTexel: MaterialValue, isNormal: boolean): MaterialValue {
   const c = (SS - 1) / 2;
   let acc: MaterialValue = vec3(0, 0, 0);
   for (let j = 0; j < SS; j++)
     for (let i = 0; i < SS; i++) {
       const off = vec2(i - c, j - c).mul(ssTexel);
-      let s: MaterialValue = texture(ssRT.texture, uv().add(off)).xyz;
+      let s: MaterialValue = texture(ssTex, uv().add(off)).xyz;
       if (isNormal) s = s.mul(2).sub(1);
       acc = acc.add(s);
     }
   acc = acc.div(SS * SS);
   return isNormal ? normalize(acc).mul(0.5).add(0.5) : acc;
 }
-const downColorMat = new MeshBasicNodeMaterial();
-downColorMat.colorNode = downsampleNode(false);
-const downNormalMat = new MeshBasicNodeMaterial();
-downNormalMat.colorNode = downsampleNode(true);
-const downColorQuad = new QuadMesh(downColorMat);
-const downNormalQuad = new QuadMesh(downNormalMat);
+
+// A supersample intermediate + its two prebuilt downsample quads, all bound to a FIXED high-res size.
+// Raw high-res RT stores already-encoded channel values verbatim (no colorspace / filtering so the box taps
+// read exact texels). The downsample quads' node graphs reference THIS target's texture, so the target must
+// never be resized — instead we pool one set per size (see ssTargetsFor).
+interface SsTargets {
+  ssRT: RenderTarget;
+  downColorQuad: QuadMesh;
+  downNormalQuad: QuadMesh;
+}
+// Pool keyed by "<w>x<h>" of the high-res target. The interactive surface bake (e.g. 2048²) and the 2D
+// preview / PNG readback (a smaller size) each keep their OWN persistent target, instead of resizing one
+// shared RT back and forth on every edit — each setSize disposes + recreates the GPU colour/depth textures
+// (16MB at 2048²), and under rapid editing Dawn's deferred frees pile up into gigabytes (tab OOM). Sizes in
+// use are few (surface + preview + export), so the pool is small and bounded, not per-edit growth.
+const ssPool = new Map<string, SsTargets>();
+
+function ssTargetsFor(w: number, h: number): SsTargets {
+  const key = `${w}x${h}`;
+  const existing = ssPool.get(key);
+  if (existing) return existing;
+  const ssRT = new RenderTarget(w, h);
+  ssRT.texture.colorSpace = NoColorSpace;
+  ssRT.texture.minFilter = ssRT.texture.magFilter = NearestFilter;
+  ssRT.texture.wrapS = ssRT.texture.wrapT = RepeatWrapping; // box taps at tile edges wrap, not clamp
+  const ssTexel = vec2(1 / w, 1 / h); // constant for this size
+  const mkDown = (isNormal: boolean): QuadMesh => {
+    const mat = new MeshBasicNodeMaterial();
+    mat.colorNode = downsampleNode(ssRT.texture, ssTexel, isNormal);
+    return new QuadMesh(mat);
+  };
+  const targets: SsTargets = { ssRT, downColorQuad: mkDown(false), downNormalQuad: mkDown(true) };
+  ssPool.set(key, targets);
+  return targets;
+}
 
 // A persistent per-channel bake material. The caller assigns `.colorNode` (+ `needsUpdate`) ONCE per compile;
 // re-rendering it later with only changed uniform values reuses its pipeline (no recompile).
@@ -74,8 +96,9 @@ export function makeChannelMaterial(): MeshBasicNodeMaterial {
 
 // One throwaway scene of fullscreen quads used ONLY to pre-compile bake pipelines (never rendered from).
 // QuadMesh shares one module geometry, and three's render pipeline cache key is (shader stages, material
-// render-state, render-target format, scale-sign) — NOT mesh identity — so a pipeline compiled on these
-// quads against `ssRT` is the exact one `bakeQuad` reuses when it renders the same material into `ssRT`.
+// render-state, render-target format, scale-sign) — NOT mesh identity or SIZE — so a pipeline compiled on
+// these quads against the supersample target is the exact one `bakeQuad` reuses when it renders the same
+// material into it (every pooled ssRT shares the same format, so any of them warms the right pipeline).
 const compileScene = new Scene();
 const compileCamera = new OrthographicCamera(-1, 1, 1, -1, 0, 1);
 const compileQuads: QuadMesh[] = [];
@@ -91,6 +114,7 @@ const compileQuads: QuadMesh[] = [];
 export async function compileMaterialsAsync(
   renderer: WebGPURenderer,
   materials: MeshBasicNodeMaterial[],
+  destSize: number,
 ): Promise<void> {
   while (compileQuads.length < materials.length) compileQuads.push(new QuadMesh());
   compileScene.clear();
@@ -99,7 +123,8 @@ export async function compileMaterialsAsync(
     compileScene.add(compileQuads[i]);
   }
   const previous = renderer.getRenderTarget();
-  renderer.setRenderTarget(ssRT); // compile against the channel's actual target (format-matched pipeline)
+  // Compile against the supersample target the channels actually render into (format-matched pipeline).
+  renderer.setRenderTarget(ssTargetsFor(destSize * SS, destSize * SS).ssRT);
   await renderer.compileAsync(compileScene, compileCamera);
   renderer.setRenderTarget(previous);
 }
@@ -128,10 +153,10 @@ export function renderMaterialToTarget(
   rt: RenderTarget,
   isNormal = false,
 ): void {
-  const w = rt.width;
-  const h = rt.height;
-  if (ssRT.width !== w * SS || ssRT.height !== h * SS) ssRT.setSize(w * SS, h * SS);
-  ssTexel.value.set(1 / (w * SS), 1 / (h * SS));
+  // Pick (or lazily create) the persistent supersample target for this destination size — never resize a
+  // shared one (see ssTargetsFor). Same-size renders reuse the same GPU textures, so nothing is created or
+  // destroyed per bake.
+  const { ssRT, downColorQuad, downNormalQuad } = ssTargetsFor(rt.width * SS, rt.height * SS);
   bakeQuad.material = material;
   const previous = renderer.getRenderTarget();
   renderer.setRenderTarget(ssRT); // 1) render the channel at SS×

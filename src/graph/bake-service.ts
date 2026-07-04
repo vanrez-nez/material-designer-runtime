@@ -227,6 +227,25 @@ export class BakedTextureSet {
     return this.cacheTarget(cacheId, size, mips).texture;
   }
 
+  // Drop every decomposition cache the current compile no longer references. Cache ids embed node ids
+  // (`groupId/portKey`, `nodeId/field`), so deleting/recreating a group — or loading a different document
+  // into this set — orphans the old entries; without pruning each one pins an 11–43MB 16F render target
+  // for the life of the surface (the unbounded GPU growth on group churn / document switches). Safe to
+  // dispose between bakes: cache textures are only sampled by bake materials during a bake render, never
+  // by the on-screen surface, and the serial queue guarantees the previous bake's GPU work has drained.
+  pruneCaches(liveIds: ReadonlySet<string>): void {
+    for (const [id, rt] of this.cacheTargets) {
+      if (liveIds.has(id)) continue;
+      rt.dispose();
+      this.cacheTargets.delete(id);
+    }
+    for (const [id, m] of this.cacheMats) {
+      if (liveIds.has(id)) continue;
+      m.dispose();
+      this.cacheMats.delete(id);
+    }
+  }
+
   // Any already-allocated render target, for a 1px GPU-completion readback (back-pressure). Null if nothing
   // has been baked yet.
   firstTarget(): RenderTarget | null {
@@ -387,6 +406,10 @@ export class MaterialBakeService {
       const nodeCount = countGraphNodes(graph.document);
       set.uniforms = uniforms; // retained so a uniform-only edit can re-render without recompiling
       set.cachePlan = cachePlan; // retained so a uniform re-render regenerates caches in the same order
+      // Prune caches orphaned by this compile (deleted/recreated groups, document switches). Skipped under
+      // solo: a solo compile intentionally omits the group caches, and dropping them would force a full
+      // (multi-hundred-MB) cache re-render on every solo toggle.
+      if (!opts.soloNodeId) set.pruneCaches(new Set(cachePlan.map((e) => e.cacheId)));
       const channels = opts.channels ?? set.channels;
       const present = new Set<PbrSocket>();
       // Collect channel jobs first (assigning colorNode + needsUpdate is what marks them for recompile).
@@ -447,6 +470,7 @@ export class MaterialBakeService {
           await compileMaterialsAsync(
             renderer,
             jobs.map((j) => j.mat),
+            set.size,
           );
         } finally {
           this.compileGateDepth -= 1;
@@ -580,6 +604,15 @@ export class MaterialBakeService {
       });
       const node = (bundle as Partial<Record<string, MaterialValue>>)[channel];
       if (!node) return null;
+      // Same orphan problem as the surface set: scratch caches are keyed by node-id-derived cacheIds, so
+      // group churn / document switches would pin stale 16F targets until the readback size changes.
+      const liveIds = new Set(cachePlan.map((entry) => entry.cacheId));
+      for (const [id, c] of this.scratchCaches) {
+        if (liveIds.has(id)) continue;
+        c.rt.dispose();
+        c.mat.dispose();
+        this.scratchCaches.delete(id);
+      }
       for (const entry of cachePlan) {
         const c = this.scratchCache(entry.cacheId, size, cacheSizeFor(size, entry.sizing), cacheWantsMips(entry.sizing));
         c.mat.colorNode = entry.colorNode;

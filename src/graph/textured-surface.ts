@@ -61,6 +61,10 @@ export class TexturedSurface {
   // targets/materials) and bake a fresh one — a from-scratch flush of all cached GPU state for this material.
   private flushRequested = false;
   private readonly listeners = new Set<() => void>();
+  // Fired whenever the baked channel textures change content (every rebuild AND every uniform re-render),
+  // so a consumer that samples the baked textures directly (the 2D preview) knows to re-render. Distinct
+  // from `listeners`/onRebuilt, which fires only on a material-object swap (re-point mesh.material).
+  private readonly textureListeners = new Set<() => void>();
   private lastError_: string | null = null;
   // Processing lifecycle: `busy` is true while a bake / re-render is in flight — including the in-place
   // texture resize at the start of a rebuild. Consumers gate their render loop on it, since rendering
@@ -127,6 +131,32 @@ export class TexturedSurface {
   }
   private notify(): void {
     for (const fn of this.listeners) fn();
+  }
+
+  // Subscribe to baked-texture content updates — fires after every offline bake AND every uniform re-render,
+  // so a consumer sampling the baked channel textures directly (the 2D preview) can redraw. Returns an
+  // unsubscribe fn.
+  onTexturesUpdated(fn: () => void): () => void {
+    this.textureListeners.add(fn);
+    return () => this.textureListeners.delete(fn);
+  }
+  private notifyTexturesUpdated(): void {
+    for (const fn of this.textureListeners) fn();
+  }
+
+  // The baked GPU texture for a channel (null if that channel isn't currently connected/baked). A consumer
+  // samples this directly — no readback, no re-bake. The object is stable across bakes (re-rendered in
+  // place), so a consumer can keep sampling the same THREE.Texture and just redraw on onTexturesUpdated.
+  getChannelTexture(ch: PbrSocket): THREE.Texture | null {
+    return this.set.texture(ch);
+  }
+  // The baked height field texture (null if the graph has no height output). Same stable-object contract.
+  getHeightTexture(): THREE.Texture | null {
+    return this.set.heightTarget?.texture ?? null;
+  }
+  // The channels connected/baked at the last bake. Consumers use this to know which previews to show.
+  presentChannels(): ReadonlySet<PbrSocket> {
+    return new Set(this.set.present);
   }
 
   // Re-derive the material from the current graph + backend (awaitable). Call after the service gains a
@@ -282,6 +312,8 @@ export class TexturedSurface {
     try {
       await this.service.rerenderInto(this.set, this.source);
       this.lastError_ = this.graph.lastError;
+      // Baked channel textures changed content (same objects, new pixels) — tell direct consumers to redraw.
+      this.notifyTexturesUpdated();
     } catch (err) {
       this.lastError_ = err instanceof Error ? err.message : String(err);
       console.warn("[textured-surface] re-render failed:", this.lastError_);
@@ -300,6 +332,10 @@ export class TexturedSurface {
   // service, rewire on a channel-set change. Otherwise: compile the procedural live material.
   private async rebuild(): Promise<void> {
     this.enterProcessing();
+    // A live-compiled material that gets replaced must be disposed, or the renderer's strong caches
+    // (node-builder states, WGSL programs, pipelines) keep its whole compiled graph alive forever —
+    // disposing fires the material's `dispose` event, which is what releases those entries.
+    const previous = this.material_;
     try {
       try {
       if (this.backend === "offline" && this.service.hasRenderer) {
@@ -336,6 +372,11 @@ export class TexturedSurface {
         console.warn("[textured-surface] rebuild failed:", this.lastError_);
       }
       this.notify();
+      // Baked channel textures were (re)rendered — tell direct consumers (the 2D preview) to redraw.
+      this.notifyTexturesUpdated();
+      // Dispose only after notify(): listeners re-point their mesh.material first, so nothing renders
+      // the disposed material. The stable offlineMat is never disposed here (it's reused for life).
+      if (previous !== this.material_ && previous !== this.offlineMat) previous.dispose();
     } finally {
       this.exitProcessing();
     }
@@ -399,5 +440,6 @@ export class TexturedSurface {
   dispose(): void {
     this.set.dispose();
     this.offlineMat.dispose();
+    if (this.material_ !== this.offlineMat) this.material_.dispose();
   }
 }
