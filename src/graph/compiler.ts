@@ -1,13 +1,24 @@
 import * as THREE from "three";
-import { MeshStandardNodeMaterial, MeshPhysicalNodeMaterial } from "three/webgpu";
+import {
+  MeshStandardNodeMaterial,
+  MeshPhysicalNodeMaterial,
+  MeshLambertNodeMaterial,
+  MeshToonNodeMaterial,
+  MeshPhongNodeMaterial,
+  MeshMatcapNodeMaterial,
+  type NodeMaterial,
+} from "three/webgpu";
 import { positionWorld, uv, vec3, float, uniform, uniformArray, luminance, attribute, texture } from "three/tsl";
 import {
   GROUP_INPUT_TYPE,
   GROUP_OUTPUT_TYPE,
   GROUP_TYPE,
   MATERIAL_OUTPUT_TYPE,
+  MATERIAL_TYPE_CAPS,
+  SHADER_MATERIAL_TYPE,
   coercionFor,
   curveToArray,
+  normalizeMaterialType,
   type CurveValue,
   type BuildCtx,
   type Coercion,
@@ -16,13 +27,17 @@ import {
   type MaterialBundle,
   type MaterialGraphDocument,
   type MaterialNodeDef,
+  type MaterialType,
+  type MaterialTypeSettings,
   type MaterialValue,
   type PortKind,
 } from "./types";
 import { nodePorts, type NodeRegistry } from "./registry";
 
 export interface CompiledMaterial {
-  material: MeshStandardNodeMaterial;
+  // Any of the six stock node materials (chosen by the graph's materialType); widened from
+  // MeshStandardNodeMaterial now that the family is document-driven. Consumers assign it to mesh.material.
+  material: NodeMaterial;
   // Per-node param uniforms (nodeId -> { paramKey -> uniform node }), so the editor can live-tweak.
   uniforms: Map<string, Record<string, MaterialValue>>;
 }
@@ -231,6 +246,36 @@ export function readOutputResolution(doc: MaterialGraphDocument): number {
   const raw = out?.params?.outputResolution;
   const n = typeof raw === "string" ? Number(raw) : typeof raw === "number" ? raw : NaN;
   return Number.isFinite(n) && n > 0 ? n : 1024;
+}
+
+// The material family + type-specific settings the graph reconstructs, read from the shader node feeding
+// Material Output's `surface` input. Mirrors readOutputResolution: a shallow document read (no compile) so
+// both the live path (compileGraph) and the offline surface (textured-surface) derive the type from ONE
+// source of truth (the node's params). Falls back to "physical" when the terminal is fed by anything other
+// than a shader-material node (legacy principled-bsdf pre-migration, a mix-shader, or nothing) — matching
+// the historical hardcoded MeshPhysicalNodeMaterial, so old/uncommon graphs stay backward-compatible.
+export function readMaterialSurface(doc: MaterialGraphDocument): {
+  type: MaterialType;
+  settings: MaterialTypeSettings;
+} {
+  const out = doc.nodes.find((n) => n.type === MATERIAL_OUTPUT_TYPE);
+  const edge = out && doc.edges.find((e) => e.toNode === out.id && e.toInput === "surface");
+  const src = edge && doc.nodes.find((n) => n.id === edge.fromNode);
+  if (!src || src.type !== SHADER_MATERIAL_TYPE) return { type: "physical", settings: {} };
+  const p = src.params;
+  const numOr = (v: unknown, d: number): number => {
+    const n = Number(v);
+    return Number.isFinite(n) ? n : d;
+  };
+  return {
+    type: normalizeMaterialType(p.materialType),
+    settings: {
+      shininess: numOr(p.shininess, 30),
+      specular: typeof p.specular === "string" ? p.specular : "#111111",
+      gradientSteps: numOr(p.gradientSteps, 3),
+      matcap: typeof p.matcap === "string" ? p.matcap : "default",
+    },
+  };
 }
 
 // Offline node-level tiling — the REPEATING-UNIT model. If a `bakeTileable` node has `tileSize` set, the node
@@ -448,61 +493,122 @@ function compileGroup(
   return { outputs: result, uniforms };
 }
 
-// A bare MeshPhysicalNodeMaterial with the surface-contract defaults (DoubleSide, polygon offset). Shared
-// by the live material here and the offline surface material.
-export function newSurfaceMaterial(): MeshPhysicalNodeMaterial {
-  return new MeshPhysicalNodeMaterial({
-    metalness: 0,
-    roughness: 0.9,
-    side: THREE.DoubleSide,
-    polygonOffset: true,
-    polygonOffsetFactor: 1,
-    polygonOffsetUnits: 1,
-  });
+// Surface-contract defaults shared by every material family (DoubleSide + polygon offset so the plane and
+// sphere z-fight cleanly with the shadow catcher).
+const SURFACE_DEFAULTS = {
+  side: THREE.DoubleSide,
+  polygonOffset: true,
+  polygonOffsetFactor: 1,
+  polygonOffsetUnits: 1,
+} as const;
+
+// Toon gradient map: a 1×N greyscale ramp (evenly-spaced luminance bands) that MeshToon samples by N·L to
+// quantize diffuse into cel bands. NearestFilter keeps the steps hard. Memoized per band count so cycling
+// `gradientSteps` doesn't leak textures. There's no asset pipeline yet — this synthesizes the recognizable
+// toon look in-code; a real gradient-image loader is a later enhancement.
+const gradientCache = new Map<number, THREE.DataTexture>();
+function gradientMapFor(steps: number | undefined): THREE.DataTexture {
+  const n = Math.max(2, Math.min(5, Math.round(steps ?? 3)));
+  const cached = gradientCache.get(n);
+  if (cached) return cached;
+  const data = new Uint8Array(n);
+  for (let i = 0; i < n; i++) data[i] = Math.round((i / (n - 1)) * 255);
+  const tex = new THREE.DataTexture(data, n, 1, THREE.RedFormat);
+  tex.minFilter = THREE.NearestFilter;
+  tex.magFilter = THREE.NearestFilter;
+  tex.needsUpdate = true;
+  gradientCache.set(n, tex);
+  return tex;
 }
 
-// Unpack a resolved bundle onto a MeshPhysicalNodeMaterial's channels. `wrap` optionally transforms each
-// non-normal channel (identity for live). Normal is assigned as-is. Used by the live compile (wrap =
-// identity) and reused by the offline surface builder (wrap = triplanar sample).
-export function applyBundle(
-  material: MeshPhysicalNodeMaterial,
-  bundle: MaterialBundle,
-): void {
-  // AO modulates only the indirect/IBL term. Compose the mesh's per-vertex FORM AO (to-buffer-geometry's
-  // `vertexAo`, geometry-driven) with the graph's texture-scale DETAIL AO when the Principled AO input is
-  // connected — same as the offline backend's bakedAO × vertexAo.
-  const vertexAo = attribute("vertexAo", "float");
-  material.aoNode = bundle.ambientOcclusion ? bundle.ambientOcclusion.mul(vertexAo) : vertexAo;
-  if (bundle.baseColor) material.colorNode = bundle.baseColor;
-  if (bundle.emission) material.emissiveNode = bundle.emission;
-  if (bundle.roughness) material.roughnessNode = bundle.roughness;
-  if (bundle.metallic) material.metalnessNode = bundle.metallic;
-  if (bundle.normal) material.normalNode = bundle.normal;
-  // Physical channels — only present when the Principled lobe is active, so unused lobes stay disabled.
-  if (bundle.ior) material.iorNode = bundle.ior;
-  if (bundle.alpha) {
-    material.opacityNode = bundle.alpha;
-    material.transparent = true;
+// Matcap texture: v1 has no asset pipeline, so only the built-in fallback is supported — returning null
+// lets MeshMatcapNodeMaterial use its own vec3(mix(0.2,0.8,uv.y)) gradient (a valid shaded look). Non-
+// "default" ids are reserved for a future procedural/loaded matcap library and fall back to null for now.
+function matcapFor(_id: string | undefined): THREE.Texture | null {
+  return null;
+}
+
+// Construct the stock node material for `type` with the surface-contract defaults + any type-specific
+// settings (phong shininess/specular, toon gradient map, matcap). Shared by the live compile here and the
+// offline surface material. Default "physical" keeps every legacy caller working unchanged.
+export function newSurfaceMaterial(
+  type: MaterialType = "physical",
+  settings: MaterialTypeSettings = {},
+): NodeMaterial {
+  switch (type) {
+    case "standard":
+      return new MeshStandardNodeMaterial({ metalness: 0, roughness: 0.9, ...SURFACE_DEFAULTS });
+    case "lambert":
+      return new MeshLambertNodeMaterial({ ...SURFACE_DEFAULTS });
+    case "phong":
+      return new MeshPhongNodeMaterial({
+        shininess: settings.shininess ?? 30,
+        specular: new THREE.Color(settings.specular ?? "#111111"),
+        ...SURFACE_DEFAULTS,
+      });
+    case "toon":
+      return new MeshToonNodeMaterial({ gradientMap: gradientMapFor(settings.gradientSteps), ...SURFACE_DEFAULTS });
+    case "matcap":
+      return new MeshMatcapNodeMaterial({ matcap: matcapFor(settings.matcap), ...SURFACE_DEFAULTS });
+    case "physical":
+    default:
+      return new MeshPhysicalNodeMaterial({ metalness: 0, roughness: 0.9, ...SURFACE_DEFAULTS });
   }
-  if (bundle.coat) material.clearcoatNode = bundle.coat;
-  if (bundle.coatRoughness) material.clearcoatRoughnessNode = bundle.coatRoughness;
-  if (bundle.sheen) material.sheenNode = bundle.sheen; // float weight; three wraps as vec3 (grey sheen)
-  if (bundle.sheenRoughness) material.sheenRoughnessNode = bundle.sheenRoughness;
-  if (bundle.transmission) material.transmissionNode = bundle.transmission;
 }
 
-// Compile a document into the LIVE surface material: a procedural MeshPhysicalNodeMaterial whose channels
-// are evaluated per fragment over positionWorld (seamless 3D). The offline backend uses OfflineMaterial
-// instead (bakes channels to textures). Physical is a subclass of Standard, satisfying the preview
-// surface-material contract (plan L1/L2).
+// Unpack a resolved bundle onto the material's channels, gated by the family's capabilities
+// (MATERIAL_TYPE_CAPS): common channels (colour/normal/opacity) apply to every family; roughness/metalness
+// only to Standard-derived; the physical lobes (ior/clearcoat/sheen/transmission) only to Physical; ao and
+// emissive per their flags (Matcap is unlit → neither). The material argument is typed loosely because the
+// physical-only node setters don't exist on the narrower classes; the CAPS gate guarantees we only touch a
+// setter the concrete instance actually has. Used by the live compile; the offline surface builder mirrors
+// this gating against baked textures in textured-surface.wire.
+export function applyBundle(material: NodeMaterial, bundle: MaterialBundle, type: MaterialType): void {
+  const caps = MATERIAL_TYPE_CAPS[type];
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any -- per-family channel setters (see above)
+  const m = material as any;
+  // Common channels — every family lights these.
+  if (bundle.baseColor) m.colorNode = bundle.baseColor;
+  if (bundle.normal) m.normalNode = bundle.normal;
+  if (bundle.alpha) {
+    m.opacityNode = bundle.alpha;
+    m.transparent = true;
+  }
+  // AO modulates only the indirect/IBL term. Compose the mesh's per-vertex FORM AO (to-buffer-geometry's
+  // `vertexAo`, geometry-driven) with the graph's texture-scale DETAIL AO when connected — same as the
+  // offline backend's bakedAO × vertexAo. Skipped entirely for unlit Matcap (no aoNode).
+  if (caps.ao) {
+    const vertexAo = attribute("vertexAo", "float");
+    m.aoNode = bundle.ambientOcclusion ? bundle.ambientOcclusion.mul(vertexAo) : vertexAo;
+  }
+  if (caps.emissive && bundle.emission) m.emissiveNode = bundle.emission;
+  if (caps.roughMetal) {
+    if (bundle.roughness) m.roughnessNode = bundle.roughness;
+    if (bundle.metallic) m.metalnessNode = bundle.metallic;
+  }
+  // Physical channels — only present when the lobe is active, so unused lobes stay disabled.
+  if (caps.physicalLobes) {
+    if (bundle.ior) m.iorNode = bundle.ior;
+    if (bundle.coat) m.clearcoatNode = bundle.coat;
+    if (bundle.coatRoughness) m.clearcoatRoughnessNode = bundle.coatRoughness;
+    if (bundle.sheen) m.sheenNode = bundle.sheen; // float weight; three wraps as vec3 (grey sheen)
+    if (bundle.sheenRoughness) m.sheenRoughnessNode = bundle.sheenRoughness;
+    if (bundle.transmission) m.transmissionNode = bundle.transmission;
+  }
+}
+
+// Compile a document into the LIVE surface material: a procedural node material (the family chosen by the
+// graph's materialType, default Physical) whose channels are evaluated per fragment over positionWorld
+// (seamless 3D). The offline backend bakes channels to textures instead (see textured-surface).
 export function compileGraph(
   doc: MaterialGraphDocument,
   registry: NodeRegistry,
   opts: CompileOptions,
 ): CompiledMaterial {
   const { bundle, uniforms: uniformsByNode } = compileSockets(doc, registry, opts);
-  const material = newSurfaceMaterial();
-  applyBundle(material, bundle);
+  const { type, settings } = readMaterialSurface(doc);
+  const material = newSurfaceMaterial(type, settings);
+  applyBundle(material, bundle, type);
   return { material, uniforms: uniformsByNode };
 }
 

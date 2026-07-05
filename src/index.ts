@@ -21,6 +21,7 @@ export {
   compileSockets,
   countGraphNodes,
   newSurfaceMaterial,
+  readMaterialSurface,
   readOutputResolution,
   type CompileOptions,
   type CompiledSockets,

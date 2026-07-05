@@ -3,13 +3,14 @@ import { compileSockets } from "./graph/compiler";
 import { defaultRegistry, nodeParamDefs, type NodeRegistry } from "./graph/registry";
 import {
   MATERIAL_OUTPUT_TYPE,
+  SHADER_MATERIAL_TYPE,
   type GraphChange,
   type MaterialGraphDocument,
   type MaterialGraphSource,
   type ParamDef,
 } from "./graph/types";
 
-export const MATERIAL_DOCUMENT_VERSION = 2;
+export const MATERIAL_DOCUMENT_VERSION = 3;
 
 export function cloneMaterialDocument(doc: MaterialGraphDocument): MaterialGraphDocument {
   return structuredClone(doc);
@@ -19,8 +20,26 @@ export function createDefaultMaterialDocument(): MaterialGraphDocument {
   return cloneMaterialDocument(defaultDocument as MaterialGraphDocument);
 }
 
+// v2 → v3: the legacy Principled BSDF node is replaced by the polymorphic shader-material node. Rewrite each
+// `principled-bsdf` node in place to `shader-material` with materialType="physical" (its params are a subset
+// of the new node's superset, so they copy verbatim), recursing into group subgraphs. Idempotent — a v3 doc
+// has no principled-bsdf nodes, so re-running is a no-op.
+function migrateNodesToV3(doc: MaterialGraphDocument): void {
+  for (const node of doc.nodes) {
+    if (node.type === "principled-bsdf") {
+      node.type = SHADER_MATERIAL_TYPE;
+      node.params = { ...node.params, materialType: "physical" };
+    }
+    if (node.subgraph) migrateNodesToV3(node.subgraph);
+  }
+}
+
 export function migrateMaterialDocument(doc: MaterialGraphDocument): MaterialGraphDocument {
-  return { ...cloneMaterialDocument(doc), version: doc.version ?? MATERIAL_DOCUMENT_VERSION };
+  const next = cloneMaterialDocument(doc);
+  // A missing version is treated as pre-v3 (legacy); the rewrite is idempotent so this is always safe.
+  if ((doc.version ?? 0) < 3) migrateNodesToV3(next);
+  next.version = MATERIAL_DOCUMENT_VERSION;
+  return next;
 }
 
 function findNode(doc: MaterialGraphDocument, nodeId: string) {
@@ -32,6 +51,7 @@ function findParam(defs: ParamDef[], key: string): ParamDef | undefined {
 }
 
 function paramChangeKind(param: ParamDef): GraphChange["kind"] {
+  if (param.structural) return "structural"; // construction-time settings (e.g. phong shininess/specular)
   return param.type === "float" || param.type === "color" || param.type === "vec3" || param.type === "curve"
     ? "param"
     : "structural";

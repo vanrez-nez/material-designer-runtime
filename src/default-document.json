@@ -1,7 +1,7 @@
 {
-  "version": 2,
+  "version": 3,
   "nodes": [
-    { "id": "pr", "type": "principled-bsdf", "params": {}, "position": { "x": 420, "y": 160 }, "enabled": true },
+    { "id": "pr", "type": "shader-material", "params": { "materialType": "physical" }, "position": { "x": 420, "y": 160 }, "enabled": true },
     { "id": "out", "type": "material-output", "params": {}, "position": { "x": 740, "y": 180 }, "enabled": true }
   ],
   "edges": [{ "fromNode": "pr", "fromOutput": "bsdf", "toNode": "out", "toInput": "surface" }]

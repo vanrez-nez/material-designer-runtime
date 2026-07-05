@@ -1,16 +1,19 @@
 import * as THREE from "three";
-import type { MeshStandardNodeMaterial } from "three/webgpu";
+import type { NodeMaterial } from "three/webgpu";
 import { uniform, vec3, normalWorld, texture, normalMap, float, attribute, uv } from "three/tsl";
-import { compileGraph, newSurfaceMaterial, readOutputResolution } from "./compiler";
+import { compileGraph, newSurfaceMaterial, readMaterialSurface, readOutputResolution } from "./compiler";
 import { triplanarColor } from "../tsl/triplanar";
 import { triplanarNormalMap } from "../tsl/triplanar-normal";
 import { parallaxOcclusionUV } from "../tsl/parallax";
 import {
+  MATERIAL_TYPE_CAPS,
   curveToArray,
   type CurveValue,
   type GraphChange,
   type MaterialBackend,
   type MaterialGraphSource,
+  type MaterialType,
+  type MaterialTypeSettings,
   type MaterialValue,
   type PbrSocket,
 } from "./types";
@@ -19,6 +22,13 @@ import { SURFACE_CHANNELS, type MaterialBakeService, type BakedTextureSet } from
 // Parallax-occlusion march steps (LINEAR cost, paid per preview fragment — the dominant GPU cost of the
 // effect). 12 is the perf/quality balance.
 const PARALLAX_LAYERS = 12;
+
+// A stable signature of the material family + its construction-time settings, so the offline surface knows
+// when to reconstruct offlineMat (the family, phong shininess/specular, toon gradient steps, matcap look all
+// bake into the material at construction — a change to any means a new material object).
+function materialSig(type: MaterialType, s: MaterialTypeSettings): string {
+  return [type, s.shininess, s.specular, s.gradientSteps, s.matcap].join("|");
+}
 // The on-screen surface bakes at the graph's authored `outputResolution` (Material Output), so the viewport is
 // an exact preview of what an export at that resolution produces — lowering it makes editing cheaper AND the
 // intermediate caches smaller, raising it (2048/4096) makes each re-bake heavier. See surfaceBakeSize().
@@ -30,13 +40,17 @@ const PARALLAX_LAYERS = 12;
 // object's document, so editing one surface can't knock out another. Subscribes to the graph's onChange and
 // reacts: live-uniform tweak (live backend) / debounced re-bake (offline) / full rebuild (structural).
 export class TexturedSurface {
-  // The baked offline surface material (stock PBR sampling the baked maps). Stable object; re-bakes render
-  // into its textures in place.
-  private readonly offlineMat = newSurfaceMaterial();
+  // The baked offline surface material (the family chosen by the graph's materialType, sampling the baked
+  // maps). Re-bakes render into its textures in place; it is reconstructed only when the material family or
+  // its construction-time settings change (see rebuild → materialSig).
+  private offlineMat: NodeMaterial = newSurfaceMaterial();
+  // The family + settings signature currently baked into offlineMat, so rebuild knows when to reconstruct it.
+  private matType: MaterialType = "physical";
+  private matSig = "";
   // Per-node uniforms from the last live compile (for the live-backend live-tweak fast path).
   private liveUniforms = new Map<string, Record<string, MaterialValue>>();
   // The currently-presented material (offline or live), re-read by listeners on rebuild.
-  private material_: MeshStandardNodeMaterial;
+  private material_: NodeMaterial;
 
   readonly scaleUniform = uniform(1.2); // triplanar world scale (the "world / tile" control)
   readonly sharpnessUniform = uniform(8); // triplanar blend exponent
@@ -86,8 +100,8 @@ export class TexturedSurface {
   }
 
   // The material to put on the mesh. Re-read by onRebuilt listeners whenever it changes (backend switch /
-  // live recompile). Offline re-bakes keep the same object (textures update in place).
-  get material(): MeshStandardNodeMaterial {
+  // live recompile / material-family change). Offline re-bakes of the same family keep the same object.
+  get material(): NodeMaterial {
     return this.material_;
   }
 
@@ -336,6 +350,8 @@ export class TexturedSurface {
     // (node-builder states, WGSL programs, pipelines) keep its whole compiled graph alive forever —
     // disposing fires the material's `dispose` event, which is what releases those entries.
     const previous = this.material_;
+    // A superseded offline material (when the family/settings change) — disposed after notify(), like `previous`.
+    let replacedOffline: NodeMaterial | undefined;
     try {
       try {
       if (this.backend === "offline" && this.service.hasRenderer) {
@@ -350,6 +366,19 @@ export class TexturedSurface {
           this.set.flushCaches();
         }
         this.set.resize(size);
+        // Reconcile the offline material with the document's chosen family + construction-time settings.
+        // Reconstruct only when they actually change (newSurfaceMaterial builds the correct family, phong
+        // shininess/specular, toon gradient map, etc.) — a normal re-bake of the same family reuses the object
+        // so nothing it has bound is destroyed mid-render. A family change forces a rewire below.
+        const { type, settings } = readMaterialSurface(this.graph.document);
+        const sig = materialSig(type, settings);
+        const familyChanged = sig !== this.matSig;
+        if (familyChanged) {
+          replacedOffline = this.offlineMat;
+          this.offlineMat = newSurfaceMaterial(type, settings);
+          this.matType = type;
+          this.matSig = sig;
+        }
         const soloNodeId = this.graph.soloNode ?? undefined;
         const t0 = performance.now();
         const changed = await this.service.bakeInto(this.set, this.graph, {
@@ -358,7 +387,7 @@ export class TexturedSurface {
           source: this.source,
         });
         this.lastBakeMs = performance.now() - t0;
-        if (changed || !this.wiredOnce) {
+        if (changed || !this.wiredOnce || familyChanged) {
           this.wire(this.set.present);
           this.wiredOnce = true;
         }
@@ -375,15 +404,18 @@ export class TexturedSurface {
       // Baked channel textures were (re)rendered — tell direct consumers (the 2D preview) to redraw.
       this.notifyTexturesUpdated();
       // Dispose only after notify(): listeners re-point their mesh.material first, so nothing renders
-      // the disposed material. The stable offlineMat is never disposed here (it's reused for life).
-      if (previous !== this.material_ && previous !== this.offlineMat) previous.dispose();
+      // the disposed material. The current offlineMat is reused across re-bakes (never disposed here); a
+      // SUPERSEDED offlineMat (family change) is disposed via replacedOffline, exactly once.
+      if (previous !== this.material_ && previous !== this.offlineMat && previous !== replacedOffline)
+        previous.dispose();
+      if (replacedOffline) replacedOffline.dispose();
     } finally {
       this.exitProcessing();
     }
   }
 
   // Compile the procedural live material (used as a startup fallback and the "live" backend).
-  private buildLive(): MeshStandardNodeMaterial {
+  private buildLive(): NodeMaterial {
     const soloNodeId = this.graph.soloNode ?? undefined;
     const { material, uniforms } = compileGraph(this.graph.document, this.graph.getRegistry(), {
       backend: "live",
@@ -397,7 +429,11 @@ export class TexturedSurface {
   // channel set changes — re-baking re-renders the same texture objects in place.
   private wire(present: Set<PbrSocket>): void {
     this.lastPresent = present;
-    const m = this.offlineMat;
+    // Loosely typed: the per-family channel setters (roughnessNode/metalnessNode/…) don't all exist on the
+    // narrower material classes; the CAPS gate below guarantees we only touch setters the instance has.
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const m = this.offlineMat as any;
+    const caps = MATERIAL_TYPE_CAPS[this.matType];
     const scale = this.scaleUniform;
     const sharp = this.sharpnessUniform;
     const useParallax = this.set.hasHeight && !this.triplanar && this.parallaxScale.value > 0;
@@ -427,13 +463,19 @@ export class TexturedSurface {
       m.needsUpdate = true;
       return;
     }
+    // Common channels — every family lights these.
     m.colorNode = present.has("baseColor") ? sample("baseColor").mul(this.colorTint) : null;
-    m.roughnessNode = present.has("roughness") ? sample("roughness").r.mul(this.roughnessFactor) : null;
-    m.metalnessNode = present.has("metallic") ? sample("metallic").r.mul(this.metalnessFactor) : null;
-    const vAo = attribute("vertexAo", "float");
-    m.aoNode = present.has("ambientOcclusion") ? sample("ambientOcclusion").r.mul(vAo) : vAo;
     m.normalNode = present.has("normal") ? shadingNormal : null;
-    m.emissiveNode = present.has("emission") ? sample("emission") : null;
+    // Roughness/metalness only exist on Standard-derived families; the glTF-style factors ride them.
+    if (caps.roughMetal) {
+      m.roughnessNode = present.has("roughness") ? sample("roughness").r.mul(this.roughnessFactor) : null;
+      m.metalnessNode = present.has("metallic") ? sample("metallic").r.mul(this.metalnessFactor) : null;
+    }
+    if (caps.ao) {
+      const vAo = attribute("vertexAo", "float");
+      m.aoNode = present.has("ambientOcclusion") ? sample("ambientOcclusion").r.mul(vAo) : vAo;
+    }
+    if (caps.emissive) m.emissiveNode = present.has("emission") ? sample("emission") : null;
     m.needsUpdate = true;
   }
 

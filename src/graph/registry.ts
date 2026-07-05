@@ -30,6 +30,7 @@ import { vectorMathNode } from "./nodes/vector/vector-math";
 import { normalFromHeightNode } from "./nodes/vector/normal-from-height";
 import { normalMapNode } from "./nodes/vector/normal-map";
 import { mappingNode } from "./nodes/vector/mapping";
+import { shaderMaterialNode } from "./nodes/shader/shader-material";
 import { principledBsdfNode } from "./nodes/shader/principled-bsdf";
 import { emissionNode } from "./nodes/shader/emission";
 import { mixShaderNode } from "./nodes/shader/mix-shader";
@@ -121,6 +122,7 @@ export function createDefaultRegistry(): NodeRegistry {
     .register(normalFromHeightNode)
     .register(normalMapNode)
     .register(mappingNode)
+    .register(shaderMaterialNode)
     .register(principledBsdfNode)
     .register(emissionNode)
     .register(mixShaderNode)

@@ -31,10 +31,10 @@ export interface TilingTestOptions {
   onTile?: (type: string, img: ImageData) => void | Promise<void>; // hook to e.g. save a composite PNG.
 }
 
-// One noise type → a minimal graph: Tileable Noise (field) → Principled (baseColor) → Material Output.
+// One noise type → a minimal graph: Tileable Noise (field) → Material (baseColor) → Material Output.
 function noiseDoc(noiseType: string): MaterialGraphDocument {
   return {
-    version: 2,
+    version: 3,
     nodes: [
       {
         id: "n",
@@ -43,7 +43,7 @@ function noiseDoc(noiseType: string): MaterialGraphDocument {
         position: { x: 0, y: 0 },
         enabled: true,
       },
-      { id: "pr", type: "principled-bsdf", params: {}, position: { x: 300, y: 0 }, enabled: true },
+      { id: "pr", type: "shader-material", params: { materialType: "physical" }, position: { x: 300, y: 0 }, enabled: true },
       { id: "out", type: "material-output", params: {}, position: { x: 600, y: 0 }, enabled: true },
     ],
     edges: [

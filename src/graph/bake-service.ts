@@ -159,15 +159,24 @@ export class BakedTextureSet {
     this.size = size;
   }
 
-  // Resize every channel/height target IN PLACE, preserving the THREE.Texture objects the live surface
-  // samples (RenderTarget.setSize swaps the underlying GPU texture but keeps the wrapper), then flush the
-  // size-dependent caches. Used instead of allocating a new set on an output-resolution change, so nothing
-  // the render loop has bound is destroyed. No-op when the size is unchanged.
+  // Resize every channel/height target IN PLACE, preserving the THREE.Texture wrapper objects the live
+  // surface and the 2D preview keep bound across async boundaries (recreating them makes those consumers
+  // submit a freed texture — "Destroyed texture used in a submit"). `setSize` alone, though, dispose+reallocs
+  // the GPU texture but leaves the mipmap chain unregenerated, so a mip/LOD-sampling consumer reads BLACK for
+  // the resized channel until reload — so we also bump `texture.version` (needsUpdate) to force the backend
+  // to rebuild the texture (mips included) on next use, matching a fresh allocation. Then flush the
+  // size-dependent caches. No-op when the size is unchanged.
   resize(size: number): void {
     if (size === this.size) return;
     this.size = size;
-    for (const rt of this.targets.values()) rt.setSize(size, size);
-    this.heightTarget?.setSize(size, size);
+    for (const rt of this.targets.values()) {
+      rt.setSize(size, size);
+      rt.texture.needsUpdate = true;
+    }
+    if (this.heightTarget) {
+      this.heightTarget.setSize(size, size);
+      this.heightTarget.texture.needsUpdate = true;
+    }
     this.flushCaches();
   }
 

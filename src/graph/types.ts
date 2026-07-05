@@ -88,11 +88,59 @@ export interface ParamDef {
   // bake, so the surface's offline uniform fast-path skips it and re-bakes. (In the LIVE backend such params
   // may still be real uniforms; that path is unaffected.)
   bakeStructural?: boolean;
+  // True for a param applied at material CONSTRUCTION (not as a live uniform node) — e.g. the shader node's
+  // phong shininess/specular, which reconstruct/reconfigure the THREE material. A change is classified as
+  // `structural` (full rebuild) even for a float/colour type, so both backends pick it up. Distinct from
+  // bakeStructural (which keeps the change a live `param` but forces the offline channels to re-bake).
+  structural?: boolean;
 }
 
 // live  = procedural node material over positionWorld (seamless 3D field; a power/debug toggle).
 // offline = the node graph is baked to textures; the surface samples them (triplanar) + stock PBR. Default.
 export type MaterialBackend = "live" | "offline";
+
+// The THREE material family a graph compiles to — one of the six stock node materials. Carried in the
+// document on the shader node's `materialType` param so loading a document reconstructs the exact THREE
+// material (not just the baked channels). "physical" is the historical default (MeshPhysicalNodeMaterial)
+// and the migration target for legacy Principled BSDF nodes. The channel outputs (MaterialBundle) stay
+// type-agnostic — the type only decides which channels are LIT and how (see compiler CAPS/applyBundle).
+export type MaterialType = "standard" | "physical" | "lambert" | "toon" | "phong" | "matcap";
+export const MATERIAL_TYPES: MaterialType[] = ["standard", "physical", "lambert", "toon", "phong", "matcap"];
+
+// Type-specific, NON-channel material settings read straight off the shader node's params (never baked,
+// never part of the MaterialBundle). Applied at material construction (see newSurfaceMaterial). Minimal for
+// v1: only settings that have no procedural channel equivalent. Undefined → the type's constructor default.
+export interface MaterialTypeSettings {
+  shininess?: number; // phong specular exponent
+  specular?: string; // phong specular colour (hex)
+  gradientSteps?: number; // toon cel-shading bands (2..5) → a synthesized gradient map
+  matcap?: string; // matcap look id (see matcapFor); "default" → the material's built-in gradient
+}
+
+// Which MaterialBundle channels each material family actually LIGHTS. The single source of truth shared by
+// the live apply (compiler.applyBundle), the offline sampler (textured-surface.wire), and the shader node's
+// build() (which emits only the channels its type uses, so the offline baker bakes only those). Non-PBR
+// families (Lambert/Toon/Phong) have no roughness/metalness; Matcap is unlit (no ao/emissive either).
+export interface MaterialTypeCaps {
+  roughMetal: boolean; // roughnessNode / metalnessNode (Standard-derived only)
+  physicalLobes: boolean; // ior / clearcoat / sheen / transmission (Physical only)
+  ao: boolean; // aoNode
+  emissive: boolean; // emissiveNode
+}
+export const MATERIAL_TYPE_CAPS: Record<MaterialType, MaterialTypeCaps> = {
+  standard: { roughMetal: true, physicalLobes: false, ao: true, emissive: true },
+  physical: { roughMetal: true, physicalLobes: true, ao: true, emissive: true },
+  lambert: { roughMetal: false, physicalLobes: false, ao: true, emissive: true },
+  phong: { roughMetal: false, physicalLobes: false, ao: true, emissive: true },
+  toon: { roughMetal: false, physicalLobes: false, ao: true, emissive: true },
+  matcap: { roughMetal: false, physicalLobes: false, ao: false, emissive: false },
+};
+
+// Coerce a raw param value to a valid MaterialType, defaulting to "physical" (the historical family +
+// migration target) for anything unrecognized/missing. Used wherever the document is read back.
+export function normalizeMaterialType(raw: unknown): MaterialType {
+  return MATERIAL_TYPES.includes(raw as MaterialType) ? (raw as MaterialType) : "physical";
+}
 
 export type GraphChange =
   | { kind: "structural" }
@@ -230,6 +278,11 @@ export interface MaterialGraphSource {
 
 // The terminal node (Blender's Material Output). Exactly one per graph; consumes a single shader marker.
 export const MATERIAL_OUTPUT_TYPE = "material-output";
+
+// The polymorphic surface/shader node (replaces Principled BSDF). Its `materialType` param selects the
+// THREE material family and reshapes its sockets/controls per type. Legacy `principled-bsdf` nodes migrate
+// to this type with materialType="physical".
+export const SHADER_MATERIAL_TYPE = "shader-material";
 
 // PBR channels the previews / channel-baker can render. Internal keys; `baseColor` shows as
 // "Albedo / Diffuse". These are a subset of the Principled BSDF inputs the compiler unpacks.
