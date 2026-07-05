@@ -220,6 +220,9 @@ export class TexturedSurface {
     this.debugNormals = on;
     this.wire(this.lastPresent);
   }
+  // Internal/debug-only backend switch — the procedural "live" backend is NOT exposed by the public
+  // MaterialGraphRuntime facade (consumers always get the baked "offline" surface). Kept here so the live
+  // compile path (startup fallback + debugging) stays reachable via `runtime.surface`.
   setBackend(backend: MaterialBackend): void {
     if (backend === this.backend) return;
     this.backend = backend;

@@ -2,7 +2,7 @@ import type { WebGPURenderer } from "three/webgpu";
 import { MaterialGraphSession } from "./document";
 import { MaterialBakeService, bakeService } from "./graph/bake-service";
 import { TexturedSurface } from "./graph/textured-surface";
-import type { MaterialBackend, MaterialGraphDocument } from "./graph/types";
+import type { MaterialGraphDocument } from "./graph/types";
 import { defaultRegistry, type NodeRegistry } from "./graph/registry";
 
 export interface MaterialGraphRuntimeOptions {
@@ -46,15 +46,6 @@ export class MaterialGraphRuntime {
   setRenderer(renderer: WebGPURenderer): this {
     this.service.attachRenderer(renderer);
     return this;
-  }
-
-  setBackend(backend: MaterialBackend): this {
-    this.surface.setBackend(backend);
-    return this;
-  }
-
-  getBackend(): MaterialBackend {
-    return this.surface.getBackend();
   }
 
   fromDocument(document: MaterialGraphDocument): this {

@@ -18,14 +18,19 @@ import { MaterialGraphRuntime } from "material-designer-runtime";
 
 const runtime = new MaterialGraphRuntime()
   .setRenderer(renderer)
-  .setBackend("offline")
   .fromDocument(document);
 
-await runtime.refresh();
-mesh.material = runtime.material;
+await runtime.refresh(); // bake the graph to channel textures
+mesh.material = runtime.material; // the exact Three.js material the document describes
 
-runtime.setOutputResolution(1024);
+// Live edits trigger an implicit re-bake — await whenIdle() before using the result
 runtime.setNodeParam("noise", "scale", 18);
+runtime.setOutputResolution(1024);
+await runtime.whenIdle();
+
+runtime.dispose(); // release GPU resources when done
 ```
+
+The graph document carries not just the procedural channels (base color, roughness, metallic, normal, …) but also the material family and its settings, so `runtime.material` reconstructs the exact Three.js material — `MeshStandardMaterial`, `MeshPhysicalMaterial`, `MeshLambertMaterial`, `MeshToonMaterial`, `MeshPhongMaterial`, or `MeshMatcapMaterial`.
 
 The editor owns UI state, selection, storage, presets, and undo history. This package owns only graph document loading, compilation, baking, direct parameter updates, and the material surface.
