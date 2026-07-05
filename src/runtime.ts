@@ -1,7 +1,9 @@
-import type { WebGPURenderer } from "three/webgpu";
+import type * as THREE from "three";
+import type { NodeMaterial, WebGPURenderer } from "three/webgpu";
 import { MaterialGraphSession } from "./document";
 import { MaterialBakeService, bakeService } from "./graph/bake-service";
 import { TexturedSurface } from "./graph/textured-surface";
+import { buildMeshMaterial } from "./graph/mesh-material";
 import type { MaterialGraphDocument } from "./graph/types";
 import { defaultRegistry, type NodeRegistry } from "./graph/registry";
 
@@ -23,8 +25,21 @@ export class MaterialGraphRuntime {
     this.surface = new TexturedSurface(this.graph, this.service, options.source);
   }
 
-  get material() {
+  // The TSL node material for the document's family (MeshStandard/Physical/…NodeMaterial), with the full
+  // procedural fidelity: triplanar, parallax-occlusion, per-vertex AO, and procedurally-driven lobes. Renders
+  // on a WebGPURenderer. Its object may change across re-bakes (family/backend switch) — re-read on onRebuilt.
+  getNodeMaterial(): NodeMaterial {
     return this.surface.material;
+  }
+
+  // A CLASSIC Three.js material (MeshStandardMaterial/MeshPhysicalMaterial/…) with the baked channel textures
+  // wired to the standard map slots and every scalar/setting loaded from the document — nothing to copy by
+  // hand. Call after refresh() so the channels are baked. Drops the node-only features (triplanar / parallax /
+  // procedural lobes); see buildMeshMaterial. Built fresh per call: the maps are the stable baked textures so
+  // channel re-bakes reflect automatically, but a material-family or scalar change needs another call.
+  // Its `.aoMap` samples the mesh's 2nd UV set — replicate uv0→uv1 on your geometry.
+  getMeshMaterial(): THREE.Material {
+    return buildMeshMaterial(this.graph.document, { get: (ch) => this.surface.getChannelTexture(ch) });
   }
 
   get lastError(): string | null {

@@ -22,10 +22,13 @@ export {
   countGraphNodes,
   newSurfaceMaterial,
   readMaterialSurface,
+  readMaterialConfig,
   readOutputResolution,
   type CompileOptions,
   type CompiledSockets,
+  type MaterialConfig,
 } from "./graph/compiler";
+export { buildMeshMaterial, type ChannelTextures } from "./graph/mesh-material";
 export {
   NodeRegistry,
   createDefaultRegistry,

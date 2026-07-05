@@ -33,6 +33,10 @@ import {
   type PortKind,
 } from "./types";
 import { nodePorts, type NodeRegistry } from "./registry";
+import { gradientMapFor, matcapFor } from "./material-textures";
+
+// Re-exported so consumers importing from the compiler keep working; the source of truth is material-textures.
+export { gradientMapFor, matcapFor };
 
 export interface CompiledMaterial {
   // Any of the six stock node materials (chosen by the graph's materialType); widened from
@@ -278,6 +282,63 @@ export function readMaterialSurface(doc: MaterialGraphDocument): {
   };
 }
 
+// The FULL resolved scalar config of the surface — every shader-material param with its default applied.
+// Where readMaterialSurface returns only the family + non-channel settings (what the node compile needs),
+// this returns everything a CLASSIC material needs to be configured by hand (see buildMeshMaterial): the
+// scalar fallbacks for channels (used when a channel wasn't baked) plus the physical lobes / phong / toon /
+// matcap settings. Defaults mirror the shader-material node's PARAMS. Falls back to a default "physical"
+// config when the terminal isn't fed by a shader-material node.
+export interface MaterialConfig {
+  type: MaterialType;
+  baseColor: string;
+  metallic: number;
+  roughness: number;
+  ior: number;
+  alpha: number;
+  coat: number;
+  coatRoughness: number;
+  sheen: number;
+  sheenRoughness: number;
+  transmission: number;
+  emission: string;
+  emissionStrength: number;
+  shininess: number;
+  specular: string;
+  gradientSteps: number;
+  matcap: string;
+}
+
+export function readMaterialConfig(doc: MaterialGraphDocument): MaterialConfig {
+  const out = doc.nodes.find((n) => n.type === MATERIAL_OUTPUT_TYPE);
+  const edge = out && doc.edges.find((e) => e.toNode === out.id && e.toInput === "surface");
+  const src = edge && doc.nodes.find((n) => n.id === edge.fromNode);
+  const p = (src && src.type === SHADER_MATERIAL_TYPE ? src.params : {}) as Record<string, unknown>;
+  const numOr = (v: unknown, d: number): number => {
+    const n = Number(v);
+    return Number.isFinite(n) ? n : d;
+  };
+  const strOr = (v: unknown, d: string): string => (typeof v === "string" ? v : d);
+  return {
+    type: normalizeMaterialType(p.materialType),
+    baseColor: strOr(p.baseColor, "#cccccc"),
+    metallic: numOr(p.metallic, 0),
+    roughness: numOr(p.roughness, 0.5),
+    ior: numOr(p.ior, 1.5),
+    alpha: numOr(p.alpha, 1),
+    coat: numOr(p.coat, 0),
+    coatRoughness: numOr(p.coatRoughness, 0.03),
+    sheen: numOr(p.sheen, 0),
+    sheenRoughness: numOr(p.sheenRoughness, 0.3),
+    transmission: numOr(p.transmission, 0),
+    emission: strOr(p.emission, "#000000"),
+    emissionStrength: numOr(p.emissionStrength, 1),
+    shininess: numOr(p.shininess, 30),
+    specular: strOr(p.specular, "#111111"),
+    gradientSteps: numOr(p.gradientSteps, 3),
+    matcap: strOr(p.matcap, "default"),
+  };
+}
+
 // Offline node-level tiling — the REPEATING-UNIT model. If a `bakeTileable` node has `tileSize` set, the node
 // builds `period / repeat` periods (via ctx.tileRepeat, so its feature COUNT drops proportionally) into a
 // tileSize² buffer, which is then sampled `repeat` times across the texture (uv × repeat). Net effect: the
@@ -501,32 +562,6 @@ const SURFACE_DEFAULTS = {
   polygonOffsetFactor: 1,
   polygonOffsetUnits: 1,
 } as const;
-
-// Toon gradient map: a 1×N greyscale ramp (evenly-spaced luminance bands) that MeshToon samples by N·L to
-// quantize diffuse into cel bands. NearestFilter keeps the steps hard. Memoized per band count so cycling
-// `gradientSteps` doesn't leak textures. There's no asset pipeline yet — this synthesizes the recognizable
-// toon look in-code; a real gradient-image loader is a later enhancement.
-const gradientCache = new Map<number, THREE.DataTexture>();
-function gradientMapFor(steps: number | undefined): THREE.DataTexture {
-  const n = Math.max(2, Math.min(5, Math.round(steps ?? 3)));
-  const cached = gradientCache.get(n);
-  if (cached) return cached;
-  const data = new Uint8Array(n);
-  for (let i = 0; i < n; i++) data[i] = Math.round((i / (n - 1)) * 255);
-  const tex = new THREE.DataTexture(data, n, 1, THREE.RedFormat);
-  tex.minFilter = THREE.NearestFilter;
-  tex.magFilter = THREE.NearestFilter;
-  tex.needsUpdate = true;
-  gradientCache.set(n, tex);
-  return tex;
-}
-
-// Matcap texture: v1 has no asset pipeline, so only the built-in fallback is supported — returning null
-// lets MeshMatcapNodeMaterial use its own vec3(mix(0.2,0.8,uv.y)) gradient (a valid shaded look). Non-
-// "default" ids are reserved for a future procedural/loaded matcap library and fall back to null for now.
-function matcapFor(_id: string | undefined): THREE.Texture | null {
-  return null;
-}
 
 // Construct the stock node material for `type` with the surface-contract defaults + any type-specific
 // settings (phong shininess/specular, toon gradient map, matcap). Shared by the live compile here and the

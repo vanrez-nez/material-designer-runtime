@@ -1,6 +1,8 @@
 import { describe, expect, it } from "vitest";
+import * as THREE from "three";
 import {
   MaterialGraphSession,
+  buildMeshMaterial,
   compileGraph,
   createDefaultMaterialDocument,
   createMaterialTopologyKey,
@@ -163,5 +165,62 @@ describe("material type transport", () => {
 
   it("falls back to physical for a non-shader-material terminal (back-compat)", () => {
     expect(readMaterialSurface(constantDoc()).type).toBe("physical");
+  });
+});
+
+describe("buildMeshMaterial (classic material reconstruction)", () => {
+  const noTextures = { get: () => null };
+  const allTextures = (() => {
+    const t = new THREE.Texture();
+    return { get: () => t };
+  })();
+
+  it("builds the classic Three.js class for each materialType", () => {
+    const cases: Array<[MaterialType, new () => THREE.Material]> = [
+      ["standard", THREE.MeshStandardMaterial],
+      ["physical", THREE.MeshPhysicalMaterial],
+      ["lambert", THREE.MeshLambertMaterial],
+      ["toon", THREE.MeshToonMaterial],
+      ["phong", THREE.MeshPhongMaterial],
+      ["matcap", THREE.MeshMatcapMaterial],
+    ];
+    for (const [type, cls] of cases) {
+      expect(buildMeshMaterial(materialDoc(type), noTextures), type).toBeInstanceOf(cls);
+    }
+    // Physical extends Standard — a "standard" doc must NOT be a Physical material.
+    expect(buildMeshMaterial(materialDoc("standard"), noTextures)).not.toBeInstanceOf(THREE.MeshPhysicalMaterial);
+  });
+
+  it("wires present channels to the standard map slots with identity scalars", () => {
+    const m = buildMeshMaterial(materialDoc("standard"), allTextures) as THREE.MeshStandardMaterial;
+    expect(m.map).not.toBeNull();
+    expect(m.roughnessMap).not.toBeNull();
+    expect(m.metalnessMap).not.toBeNull();
+    expect(m.normalMap).not.toBeNull();
+    expect(m.aoMap).not.toBeNull();
+    expect(m.roughness).toBe(1); // map carries the value — multiplier stays 1
+    expect(m.metalness).toBe(1);
+  });
+
+  it("falls back to document scalars when channels are absent", () => {
+    const doc = materialDoc("physical");
+    doc.nodes[0]!.params.roughness = 0.25;
+    doc.nodes[0]!.params.ior = 1.8;
+    doc.nodes[0]!.params.coat = 0.5;
+    const m = buildMeshMaterial(doc, noTextures) as THREE.MeshPhysicalMaterial;
+    expect(m.roughnessMap).toBeNull();
+    expect(m.roughness).toBe(0.25);
+    expect(m.ior).toBeCloseTo(1.8);
+    expect(m.clearcoat).toBe(0.5); // physical lobe loaded from the param (no baked channel)
+  });
+
+  it("loads phong shininess and toon gradient map", () => {
+    const phongDoc = materialDoc("phong");
+    phongDoc.nodes[0]!.params.shininess = 80;
+    const phong = buildMeshMaterial(phongDoc, noTextures) as THREE.MeshPhongMaterial;
+    expect(phong.shininess).toBe(80);
+
+    const toon = buildMeshMaterial(materialDoc("toon"), noTextures) as THREE.MeshToonMaterial;
+    expect(toon.gradientMap).not.toBeNull();
   });
 });
