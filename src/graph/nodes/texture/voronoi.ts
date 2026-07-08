@@ -63,7 +63,7 @@ export const voronoiNode: MaterialNodeDef = {
     // Live (3D) uses it as a continuous multiplier. EXCEPTION: the relaxed distance-to-edge path bakes scale
     // (and randomness) into CPU Lloyd seeds at build time — see build() — so live edits to those two only
     // re-tessellate after a structural change (e.g. toggling `relax`/`feature`).
-    { key: "scale", label: "scale", type: "float", min: 0.1, max: 64, step: 0.05, default: 1 },
+    { key: "scale", label: "scale", type: "float", min: 0.1, max: 512, step: 0.05, default: 1 },
     { key: "randomness", label: "randomness", type: "float", min: 0, max: 1, step: 0.01, default: 1 },
     { key: "metric", label: "metric", type: "select", options: METRICS, default: "euclidean" },
     { key: "feature", label: "feature", type: "select", options: FEATURES, default: "f1" },
@@ -125,7 +125,19 @@ export const voronoiNode: MaterialNodeDef = {
     // (different array length) is a genuine structural change.
     const relax = Math.max(0, Math.round(Number(ctx.constant("relax") ?? 0)));
     if (feature === "distance-to-edge" && offline && relax > 0) {
-      const period = Math.max(1, Math.round(Number(ctx.constant("scale") ?? 1)));
+      // The relaxed path uploads period² cell seeds as a vec3 UNIFORM array. WebGPU caps a uniform buffer at
+      // ~64 KB, so period² · 12 bytes must stay under it → period ≲ 72. Clamp here so a high `scale` degrades
+      // to the finest relaxed grid that still fits instead of silently overflowing to a black bake. For finer
+      // cells than this, use relax = 0 (the faithful jittered-grid path below scales without a seed array).
+      const RELAX_MAX_PERIOD = 64;
+      const requestedPeriod = Math.max(1, Math.round(Number(ctx.constant("scale") ?? 1)));
+      const period = Math.min(RELAX_MAX_PERIOD, requestedPeriod);
+      if (requestedPeriod > RELAX_MAX_PERIOD) {
+        console.warn(
+          `[voronoi] relaxed cells capped at scale ${RELAX_MAX_PERIOD} (requested ${requestedPeriod} exceeds the ` +
+            `uniform-buffer limit); set relax = 0 for finer faithful cells.`,
+        );
+      }
       const rnd = Number(ctx.constant("randomness") ?? 1);
       const p = coordIn.mul(period);
       const seeds = ctx.constantArray("seeds", () => relaxedCellOffsets(period, rnd, relax), "vec3");
