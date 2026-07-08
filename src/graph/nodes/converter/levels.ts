@@ -16,7 +16,7 @@ export const levelsNode: MaterialNodeDef = {
   ],
   build(ctx) {
     const input = ctx.inputs.field ?? float(0.5);
-    const f = ctx.params.invert ? input.oneMinus() : input;
-    return { field: mix(ctx.uniforms.min, ctx.uniforms.max, f) };
+    const f = ctx.constant("invert") ? input.oneMinus() : input;
+    return { field: mix(ctx.live("min"), ctx.live("max"), f) };
   },
 };

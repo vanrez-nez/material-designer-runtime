@@ -10,7 +10,7 @@ export const constantFieldNode: MaterialNodeDef = {
   outputs: [{ key: "field", kind: "float" }],
   params: [{ key: "value", label: "value", type: "float", min: 0, max: 1, step: 0.01, default: 0.5 }],
   build(ctx) {
-    return { field: ctx.uniforms.value };
+    return { field: ctx.live("value") };
   },
 };
 
@@ -22,6 +22,6 @@ export const constantColorNode: MaterialNodeDef = {
   outputs: [{ key: "color", kind: "color" }],
   params: [{ key: "color", label: "color", type: "color", default: "#808080" }],
   build(ctx) {
-    return { color: ctx.uniforms.color };
+    return { color: ctx.live("color") };
   },
 };

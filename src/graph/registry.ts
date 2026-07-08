@@ -27,6 +27,7 @@ import { separateXyzNode, combineXyzNode } from "./nodes/converter/xyz";
 import { constantFieldNode, constantColorNode } from "./nodes/input/constant";
 import { texCoordNode } from "./nodes/input/tex-coordinate";
 import { vectorMathNode } from "./nodes/vector/vector-math";
+import { vectorRotateNode } from "./nodes/vector/vector-rotate";
 import { normalFromHeightNode } from "./nodes/vector/normal-from-height";
 import { normalMapNode } from "./nodes/vector/normal-map";
 import { mappingNode } from "./nodes/vector/mapping";
@@ -119,6 +120,7 @@ export function createDefaultRegistry(): NodeRegistry {
     .register(constantColorNode)
     .register(texCoordNode)
     .register(vectorMathNode)
+    .register(vectorRotateNode)
     .register(normalFromHeightNode)
     .register(normalMapNode)
     .register(mappingNode)

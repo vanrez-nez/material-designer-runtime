@@ -32,14 +32,14 @@ export const normalFromHeightNode: MaterialNodeDef = {
   build(ctx) {
     const h = ctx.inputs.height ?? float(0.5);
     if (ctx.backend === "live") {
-      return { normal: bumpMap(h, ctx.uniforms.strength) };
+      return { normal: bumpMap(h, ctx.live("strength")) };
     }
     // offline: tangent-space normal from the resolution-independent uv-gradient of the height.
     const hv = h as V;
     const u = uv() as V;
     const dhdu = dFdx(hv).div(dFdx(u.x)) as V;
     const dhdv = dFdy(hv).div(dFdy(u.y)) as V;
-    const s = ctx.uniforms.strength as V;
+    const s = ctx.live("strength") as V;
     // Clamp the slope magnitude to MAX_SLOPE (scale down only when it exceeds it) so the normal can't
     // collapse into the tangent plane on steep/high-frequency heights — see MAX_SLOPE.
     const slope = vec2(dhdu, dhdv).mul(s) as V;

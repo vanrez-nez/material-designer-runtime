@@ -56,20 +56,19 @@ export const principledBsdfNode: MaterialNodeDef = {
   outputs: [{ key: "bsdf", kind: "shader" }],
   params: PARAMS,
   build(ctx): Record<string, MaterialValue> {
-    const u = ctx.uniforms;
     // Connected input, else the param uniform (Blender's slider fallback).
-    const inOr = (k: string): MaterialValue => ctx.inputs[k] ?? u[k];
+    const inOr = (k: string): MaterialValue => ctx.inputs[k] ?? ctx.live(k);
     // Numeric param value, falling back to the param's declared default (not 0) when absent.
-    const num = (k: string): number => Number((ctx.params[k] as number) ?? NUM_DEFAULTS[k] ?? 0);
+    const num = (k: string): number => Number((ctx.constant(k) as number) ?? NUM_DEFAULTS[k] ?? 0);
     // A physical lobe: connected input, else the param uniform only when the weight is non-zero.
     const lobe = (k: string): MaterialValue | undefined =>
-      ctx.inputs[k] !== undefined ? ctx.inputs[k] : num(k) > 0 ? u[k] : undefined;
+      ctx.inputs[k] !== undefined ? ctx.inputs[k] : num(k) > 0 ? ctx.live(k) : undefined;
 
     const emitConnected = ctx.inputs.emission !== undefined || ctx.inputs.emissionStrength !== undefined;
-    // ctx.params holds only doc-provided values; fall back to the black default when omitted.
-    const emitActive = emitConnected || ((ctx.params.emission as string) ?? "#000000") !== "#000000";
+    // ctx.constant holds only doc-provided values; fall back to the black default when omitted.
+    const emitActive = emitConnected || ((ctx.constant("emission") as string) ?? "#000000") !== "#000000";
     const emission = emitActive
-      ? (ctx.inputs.emission ?? u.emission).mul(ctx.inputs.emissionStrength ?? u.emissionStrength)
+      ? (ctx.inputs.emission ?? ctx.live("emission")).mul(ctx.inputs.emissionStrength ?? ctx.live("emissionStrength"))
       : undefined;
 
     const coat = lobe("coat");
@@ -87,7 +86,7 @@ export const principledBsdfNode: MaterialNodeDef = {
       // Texture-scale AO authored in the graph (mortar lines, pores, grooves). Input-only — undefined when
       // unconnected so no AO channel is baked; composes with the mesh's per-vertex form AO downstream.
       ambientOcclusion: ctx.inputs.ambientOcclusion,
-      alpha: ctx.inputs.alpha !== undefined ? ctx.inputs.alpha : num("alpha") < 1 ? u.alpha : undefined,
+      alpha: ctx.inputs.alpha !== undefined ? ctx.inputs.alpha : num("alpha") < 1 ? ctx.live("alpha") : undefined,
       emission,
       coat,
       coatRoughness: coat !== undefined ? inOr("coatRoughness") : undefined,

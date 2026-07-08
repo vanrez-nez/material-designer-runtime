@@ -113,12 +113,30 @@ describe("material type transport", () => {
       edges: [{ fromNode: "pr", fromOutput: "bsdf", toNode: "out", toInput: "surface" }],
     };
     const migrated = migrateMaterialDocument(legacy);
-    expect(migrated.version).toBe(3);
+    expect(migrated.version).toBe(4);
     const node = migrated.nodes.find((n) => n.id === "pr")!;
     expect(node.type).toBe("shader-material");
     expect(node.params.materialType).toBe("physical");
     expect(node.params.roughness).toBe(0.3); // legacy params preserved verbatim
     expect(legacy.nodes[0]!.type).toBe("principled-bsdf"); // migration doesn't mutate the input
+  });
+
+  it("migrates a legacy tileable-noise composition to perlin-fbm + preset (v4)", () => {
+    const legacy: MaterialGraphDocument = {
+      version: 3,
+      nodes: [
+        { id: "n", type: "tileable-noise", params: { noiseType: "erosion", scale: 7 }, position: { x: 0, y: 0 }, enabled: true },
+        { id: "out", type: "material-output", params: {}, position: { x: 320, y: 0 }, enabled: true },
+      ],
+      edges: [],
+    };
+    const migrated = migrateMaterialDocument(legacy);
+    expect(migrated.version).toBe(4);
+    const node = migrated.nodes.find((n) => n.id === "n")!;
+    expect(node.params.noiseType).toBe("perlin-fbm"); // composition re-homed onto the Perlin algorithm
+    expect(node.params.preset).toBe("erosion"); // original selection preserved as a preset
+    expect(node.params.scale).toBe(7); // other params preserved verbatim
+    expect(legacy.nodes[0]!.params.noiseType).toBe("erosion"); // migration doesn't mutate the input
   });
 
   it("compiles each materialType to its THREE node material class", () => {
@@ -222,5 +240,77 @@ describe("buildMeshMaterial (classic material reconstruction)", () => {
 
     const toon = buildMeshMaterial(materialDoc("toon"), noTextures) as THREE.MeshToonMaterial;
     expect(toon.gradientMap).not.toBeNull();
+  });
+});
+
+describe("tile per-cell outputs + vector-rotate", () => {
+  // tile.cellCoord → Vector Rotate (angle from tile.cellRandom) → noise → height. This is the per-cell
+  // oriented-detail path the board-formed concrete port needs; it must compile in both backends.
+  function perCellRotationDoc(lattice: "square" | "hex"): MaterialGraphDocument {
+    return {
+      version: 4,
+      nodes: [
+        { id: "uv", type: "tex-coordinate", params: {}, position: { x: 0, y: 0 }, enabled: true },
+        { id: "tl", type: "tile", params: { lattice, columns: 4, rows: 4 }, position: { x: 0, y: 0 }, enabled: true },
+        { id: "vr", type: "vector-rotate", params: { axis: "z" }, position: { x: 0, y: 0 }, enabled: true },
+        { id: "nz", type: "tileable-noise", params: { scale: 8 }, position: { x: 0, y: 0 }, enabled: true },
+        { id: "mat", type: "shader-material", params: { materialType: "physical" }, position: { x: 0, y: 0 }, enabled: true },
+        { id: "out", type: "material-output", params: {}, position: { x: 0, y: 0 }, enabled: true },
+      ],
+      edges: [
+        { fromNode: "uv", fromOutput: "uv", toNode: "tl", toInput: "coord" },
+        { fromNode: "tl", fromOutput: "cellCoord", toNode: "vr", toInput: "vector" },
+        // vector → float coercion (average) turns the per-cell random into a per-cell rotation angle.
+        { fromNode: "tl", fromOutput: "cellRandom", toNode: "vr", toInput: "angle" },
+        { fromNode: "vr", fromOutput: "vector", toNode: "nz", toInput: "coord" },
+        { fromNode: "nz", fromOutput: "field", toNode: "mat", toInput: "height" },
+        { fromNode: "mat", fromOutput: "bsdf", toNode: "out", toInput: "surface" },
+      ],
+    };
+  }
+
+  it("registers cellCoord/cellRandom as vector outputs on the tile node", () => {
+    const outs = defaultRegistry.get("tile").outputs;
+    expect(outs.map((o) => o.key)).toEqual(["mask", "value", "cellCoord", "cellRandom"]);
+    expect(outs.find((o) => o.key === "cellCoord")!.kind).toBe("vector");
+    expect(outs.find((o) => o.key === "cellRandom")!.kind).toBe("vector");
+    // mask/value stay first so existing presets keep resolving the same sockets.
+    expect(outs[0]!.kind).toBe("float");
+    expect(outs[1]!.kind).toBe("float");
+  });
+
+  it("exposes vector-rotate with a vector output and an angle input", () => {
+    const def = defaultRegistry.get("vector-rotate");
+    expect(def.outputs).toEqual([{ key: "vector", kind: "vector" }]);
+    expect(def.inputs.map((i) => i.key)).toEqual(["vector", "center", "angle"]);
+    expect(def.inputs.find((i) => i.key === "angle")!.kind).toBe("float");
+  });
+
+  it("compiles the per-cell rotation graph in both backends (square lattice)", () => {
+    for (const backend of ["live", "offline"] as const) {
+      const { material } = compileGraph(perCellRotationDoc("square"), defaultRegistry, { backend });
+      expect(material, backend).toBeInstanceOf(MeshPhysicalNodeMaterial);
+    }
+  });
+
+  it("compiles the per-cell rotation graph for the hex lattice", () => {
+    const { material } = compileGraph(perCellRotationDoc("hex"), defaultRegistry, { backend: "offline" });
+    expect(material).toBeInstanceOf(MeshPhysicalNodeMaterial);
+  });
+
+  it("still compiles a tile graph that only uses mask/value (back-compat)", () => {
+    const doc: MaterialGraphDocument = {
+      version: 4,
+      nodes: [
+        { id: "tl", type: "tile", params: { lattice: "square", columns: 6, rows: 12 }, position: { x: 0, y: 0 }, enabled: true },
+        { id: "mat", type: "shader-material", params: { materialType: "physical" }, position: { x: 0, y: 0 }, enabled: true },
+        { id: "out", type: "material-output", params: {}, position: { x: 0, y: 0 }, enabled: true },
+      ],
+      edges: [
+        { fromNode: "tl", fromOutput: "mask", toNode: "mat", toInput: "height" },
+        { fromNode: "mat", fromOutput: "bsdf", toNode: "out", toInput: "surface" },
+      ],
+    };
+    expect(() => compileGraph(doc, defaultRegistry, { backend: "offline" })).not.toThrow();
   });
 });

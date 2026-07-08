@@ -23,6 +23,12 @@ export const tileNode: MaterialNodeDef = {
   outputs: [
     { key: "mask", label: "Mask", kind: "float" },
     { key: "value", label: "Value", kind: "float" },
+    // Per-cell coordinate frame + extra randoms, so each tile can carry its own oriented detail. cellCoord is
+    // the fragment position local to the winning tile (cell units, ~[-0.5,0.5]) — rotate it (Vector Rotate,
+    // angle from cellRandom) to give every tile an independent grain/print direction. cellRandom is three
+    // decorrelated per-tile randoms. Both stay seamless in the offline bake (wrapped per-cell hash).
+    { key: "cellCoord", label: "Cell Coord", kind: "vector" },
+    { key: "cellRandom", label: "Cell Random", kind: "vector" },
   ],
   params: [
     { key: "lattice", label: "lattice", type: "select", options: LATTICES, default: "square" },
@@ -39,40 +45,40 @@ export const tileNode: MaterialNodeDef = {
   ],
   build(ctx) {
     const coord = (ctx.inputs.coord ?? ctx.coord) as V;
-    const columns = Math.max(1, Math.round(Number(ctx.params.columns ?? 6)));
+    const columns = Math.max(1, Math.round(Number(ctx.constant("columns") ?? 6)));
 
     // Hex lattice: a regular honeycomb. Row count is derived from columns (×2/√3, snapped even) so the
     // hexagons stay regular AND the tile wraps; columns/rows aspect, offset, and the SDF params don't apply.
-    if ((ctx.params.lattice as string) === "hex") {
+    if ((ctx.constant("lattice") as string) === "hex") {
       const hexRows = Math.max(2, Math.round((columns * 2) / Math.sqrt(3) / 2) * 2);
-      const { mask, value } = hexPattern(
+      const { mask, value, cellCoord, cellRandom } = hexPattern(
         coord,
         columns,
         hexRows,
-        ctx.uniforms.gap as V,
-        ctx.uniforms.edge as V,
+        ctx.live("gap") as V,
+        ctx.live("edge") as V,
       );
-      return { mask, value };
+      return { mask, value, cellCoord, cellRandom };
     }
 
-    const offsetFreq = Math.max(1, Math.round(Number(ctx.params.offsetFreq ?? 2)));
+    const offsetFreq = Math.max(1, Math.round(Number(ctx.constant("offsetFreq") ?? 2)));
     // Snap rows up to a multiple of offsetFreq so the offset cycle closes at the tile's top edge (seamless).
-    const rawRows = Math.max(1, Math.round(Number(ctx.params.rows ?? 12)));
+    const rawRows = Math.max(1, Math.round(Number(ctx.constant("rows") ?? 12)));
     const rows = Math.ceil(rawRows / offsetFreq) * offsetFreq;
 
-    const { mask, value } = tilePattern(
+    const { mask, value, cellCoord, cellRandom } = tilePattern(
       coord,
       { columns, rows, offsetFreq },
       {
-        rowOffset: ctx.uniforms.offset as V,
-        gap: ctx.uniforms.gap as V,
-        roundness: ctx.uniforms.roundness as V,
-        edge: ctx.uniforms.edge as V,
-        sizeRandom: ctx.uniforms.sizeRandom as V,
-        posRandom: ctx.uniforms.posRandom as V,
-        rotRandom: ctx.uniforms.rotRandom as V,
+        rowOffset: ctx.live("offset") as V,
+        gap: ctx.live("gap") as V,
+        roundness: ctx.live("roundness") as V,
+        edge: ctx.live("edge") as V,
+        sizeRandom: ctx.live("sizeRandom") as V,
+        posRandom: ctx.live("posRandom") as V,
+        rotRandom: ctx.live("rotRandom") as V,
       },
     );
-    return { mask, value };
+    return { mask, value, cellCoord, cellRandom };
   },
 };

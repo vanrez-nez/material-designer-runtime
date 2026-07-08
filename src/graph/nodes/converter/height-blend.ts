@@ -29,11 +29,11 @@ export const heightBlendNode: MaterialNodeDef = {
   build(ctx) {
     const hA = (ctx.inputs.heightA ?? float(0.5)) as V;
     let hB = (ctx.inputs.heightB ?? float(0.5)) as V;
-    const t = ctx.uniforms.transition as V;
-    const w = ctx.uniforms.width as V;
+    const t = ctx.live("transition") as V;
+    const w = ctx.live("width") as V;
     // Optional ragged border: perturb B's height by a breakup field (centered) × amount.
     if (ctx.inputs.breakup !== undefined) {
-      hB = hB.add((ctx.inputs.breakup as V).sub(0.5).mul(ctx.uniforms.breakup)) as V;
+      hB = hB.add((ctx.inputs.breakup as V).sub(0.5).mul(ctx.live("breakup"))) as V;
     }
     const d = hB.sub(hA).add(t.mul(2).sub(1)) as V; // relative height, biased by transition
     return { fac: smoothstep(w.negate(), w, d) };

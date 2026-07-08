@@ -18,8 +18,8 @@ export const emissionNode: MaterialNodeDef = {
     { key: "strength", label: "strength", type: "float", min: 0, max: 10, step: 0.1, default: 1 },
   ],
   build(ctx): Record<string, MaterialValue> {
-    const color = ctx.inputs.color ?? ctx.uniforms.color;
-    const strength = ctx.inputs.strength ?? ctx.uniforms.strength;
+    const color = ctx.inputs.color ?? ctx.live("color");
+    const strength = ctx.inputs.strength ?? ctx.live("strength");
     const bundle: MaterialBundle = {
       baseColor: vec3(0),
       roughness: float(1),

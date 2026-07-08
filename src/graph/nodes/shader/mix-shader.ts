@@ -68,7 +68,7 @@ export const mixShaderNode: MaterialNodeDef = {
   build(ctx): Record<string, MaterialValue> {
     const a = (ctx.inputs.shaderA ?? {}) as MaterialBundle;
     const b = (ctx.inputs.shaderB ?? {}) as MaterialBundle;
-    const f = (ctx.inputs.fac ?? ctx.uniforms.fac) as V;
+    const f = (ctx.inputs.fac ?? ctx.live("fac")) as V;
     return { shader: mixBundle(a, b, f) };
   },
 };

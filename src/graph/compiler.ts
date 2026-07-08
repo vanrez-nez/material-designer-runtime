@@ -63,6 +63,21 @@ export interface CacheSizing {
 // texture and records the value to bake into it (see CacheEntry).
 export type CacheAlloc = (cacheId: string, kind: PortKind, sizing?: CacheSizing) => THREE.Texture;
 
+// Node↔pipeline param contract (see memory: node-param-contract). A node's build() declares each param's
+// update category by which accessor it calls on ctx; the compiler records it here and the surface routes
+// edits off it (no bakeStructural flag). "live" = a GPU uniform (edit updates .value, no recompile);
+// "constant" = consumed at build time (edit re-runs build()).
+export type ParamUsage = Map<string, Record<string, "live" | "constant">>;
+// Retention store for ctx.constantArray: hands back a pipeline-OWNED uniformArray kept across bakes so a
+// same-length content change uploads in place (three reuses node-builder state on an unchanged cache key;
+// mutating the retained node's .array is what actually re-uploads). Injected by the bake service.
+export type ConstantArrayAlloc = (
+  nodeId: string,
+  key: string,
+  data: ArrayLike<number>,
+  elementType: "float" | "vec3",
+) => MaterialValue;
+
 // One intermediate texture to bake before the final channels: the decomposed value (encoded for a 16F linear
 // target) rendered into `cacheId`'s target. Emitted bottom-up (nested groups first).
 export interface CacheEntry {
@@ -83,6 +98,9 @@ export interface CompileOptions {
   // provider) and replaced downstream by a texture sample — so no single channel shader inlines the whole
   // graph (which overflows WebKit's 8192-byte private-var limit / freezes Firefox's sync compiler).
   allocCache?: CacheAlloc;
+  // Retention store for build-time uniform arrays (see ConstantArrayAlloc). Provided by the bake service so
+  // a constantArray survives across bakes; absent in one-off/live compiles (falls back to a fresh array).
+  allocConstantArray?: ConstantArrayAlloc;
   // The authored output resolution (Material Output), used ONLY to derive a tiled noise's repeat factor
   // (repeat = outputResolution / tileSize) so the visible repetition matches between the live preview and the
   // export regardless of the actual bake size. Filled in by compileSockets from readOutputResolution.
@@ -104,6 +122,9 @@ export interface CompiledSockets {
   // Intermediate group-output textures to bake before the channels, in bottom-up order (empty unless
   // opts.allocCache was provided). The bake service renders each `colorNode` into its `cacheId` target.
   cachePlan: CacheEntry[];
+  // Per-node record of how build() consumed each param (live vs constant) — the single source of truth the
+  // surface routes edits off. Keyed by node id, then param key.
+  paramUsage: ParamUsage;
 }
 
 // Reference working resolution for the derivative (normal) path. A cache that COMPUTES a derivative (Normal
@@ -414,7 +435,7 @@ export function compileSockets(
   const cachePlan: CacheEntry[] = [];
   // Offline only: which caches feed a derivative (normal) node downstream → render at the reference resolution.
   const derivativeCaches = opts.allocCache ? derivativeTaintedCaches(doc, registry) : new Set<string>();
-  const { outputs, uniforms } = compileDocument(
+  const { outputs, uniforms, usage } = compileDocument(
     doc, registry, opts, coord, cachePlan, derivativeCaches, undefined, solo,
   );
   // Solo preview overrides the normal Material Output bundle, but only for a previewable (non-shader) value.
@@ -422,7 +443,7 @@ export function compileSockets(
     solo && solo.value !== undefined && solo.kind && solo.kind !== "shader"
       ? soloBundle(solo.value, solo.kind)
       : resolveBundle(doc, registry, outputs);
-  return { bundle, uniforms, cachePlan };
+  return { bundle, uniforms, cachePlan, paramUsage: usage };
 }
 
 // The flat preview bundle for a soloed node: its output as baseColor (floats broadcast to grey), fully
@@ -435,6 +456,7 @@ function soloBundle(value: MaterialValue, kind: PortKind): MaterialBundle {
 interface CompiledDocument {
   outputs: Map<string, Record<string, MaterialValue>>;
   uniforms: Map<string, Record<string, MaterialValue>>;
+  usage: ParamUsage;
 }
 
 // Compile one document's nodes to per-node TSL outputs (topo order). `seededInputs` is present only for
@@ -455,6 +477,7 @@ function compileDocument(
   const byId = new Map(doc.nodes.map((n) => [n.id, n]));
   const outputsByNode = new Map<string, Record<string, MaterialValue>>();
   const uniformsByNode = new Map<string, Record<string, MaterialValue>>();
+  const usageByNode: ParamUsage = new Map();
 
   for (const id of order) {
     const node = byId.get(id);
@@ -472,9 +495,10 @@ function compileDocument(
       const ext = resolveInputs(node, doc, outputsByNode, byId, registry);
       const g = compileGroup(node, registry, opts, coord, cachePlan, derivativeCaches, ext, solo);
       outputsByNode.set(id, g.outputs);
-      // Surface the subgraph's uniforms by node id (ids are unique across the doc tree in practice) so a
-      // grouped param can be live-tweaked / re-rendered without a recompile.
+      // Surface the subgraph's uniforms + usage by node id (ids are unique across the doc tree in practice)
+      // so a grouped param can be live-tweaked / re-rendered without a recompile, and routed correctly.
       for (const [childId, u] of g.uniforms) uniformsByNode.set(childId, u);
+      for (const [childId, u] of g.usage) usageByNode.set(childId, u);
       continue;
     }
 
@@ -485,7 +509,7 @@ function compileDocument(
     // Offline tiling: the node builds `period / tileRepeat` periods so its feature size survives the ×repeat
     // sampling in maybeTileNode (repeating-unit model). 1 for non-tiled / live.
     const tileRepeat = tileRepeatFor(node, def, opts);
-    const ctx: BuildCtx = { inputs, uniforms, params: node.params, coord, backend: opts.backend, tileRepeat };
+    const ctx = makeBuildCtx(id, node, def, inputs, uniforms, coord, opts, tileRepeat, usageByNode);
     const built = def.build(ctx);
     outputsByNode.set(id, maybeTileNode(node, def, built, opts, cachePlan, tileRepeat) ?? built);
   }
@@ -501,7 +525,60 @@ function compileDocument(
     }
   }
 
-  return { outputs: outputsByNode, uniforms: uniformsByNode };
+  return { outputs: outputsByNode, uniforms: uniformsByNode, usage: usageByNode };
+}
+
+// Build the ctx handed to a node's build(). The param accessors (live/constant/constantArray) each record
+// the param's update category into `usageByNode` — the single source of truth the surface routes edits off
+// (see memory: node-param-contract). `params`/`uniforms` remain for un-migrated nodes and are removed once
+// every node reads through the accessors (the type wall that makes misclassification impossible).
+function makeBuildCtx(
+  nodeId: string,
+  node: GraphNode,
+  def: MaterialNodeDef,
+  inputs: Record<string, MaterialValue | undefined>,
+  uniforms: Record<string, MaterialValue>,
+  coord: MaterialValue,
+  opts: CompileOptions,
+  tileRepeat: number,
+  usageByNode: ParamUsage,
+): BuildCtx {
+  const usage: Record<string, "live" | "constant"> = {};
+  usageByNode.set(nodeId, usage);
+  const raw = node.params;
+  const defaultOf = (key: string): unknown => def.params.find((p) => p.key === key)?.default;
+  // No raw `params`/`uniforms` on the returned ctx — the type wall. `uniforms` (the eager map) and `raw` are
+  // captured by the closures below so live()/constant() can resolve values, but a node can't reach them.
+  return {
+    inputs,
+    coord,
+    backend: opts.backend,
+    tileRepeat,
+    live(key) {
+      // "constant wins": if the node ALSO consumes this param at build time (e.g. wave's scale — an integer
+      // period offline plus a live uniform), an edit must rebuild, so never downgrade a recorded constant.
+      if (usage[key] !== "constant") usage[key] = "live";
+      return uniforms[key];
+    },
+    constant(key) {
+      usage[key] = "constant";
+      return raw[key] ?? defaultOf(key);
+    },
+    constantArray(key, compute, elementType = "float") {
+      usage[key] = "constant";
+      const data = compute();
+      if (opts.allocConstantArray) return opts.allocConstantArray(nodeId, key, data, elementType);
+      // Fallback (no retention store — live/one-off compiles): a fresh array node. `.array` holds Vector3
+      // objects for vec3, number primitives for float (UniformArrayNode reads either).
+      if (elementType === "vec3") {
+        const vecs: THREE.Vector3[] = [];
+        for (let i = 0; i < data.length; i += 3)
+          vecs.push(new THREE.Vector3(data[i], data[i + 1], data[i + 2]));
+        return uniformArray(vecs);
+      }
+      return uniformArray(Array.from(data), "float");
+    },
+  };
 }
 
 // Compile a group node: run its subgraph with the group's external inputs seeded into the Group Input
@@ -515,18 +592,22 @@ function compileGroup(
   derivativeCaches: Set<string>,
   externalInputs: Record<string, MaterialValue | undefined>,
   solo?: SoloCapture,
-): { outputs: Record<string, MaterialValue>; uniforms: Map<string, Record<string, MaterialValue>> } {
+): {
+  outputs: Record<string, MaterialValue>;
+  uniforms: Map<string, Record<string, MaterialValue>>;
+  usage: ParamUsage;
+} {
   const sub = groupNode.subgraph;
-  if (!sub) return { outputs: {}, uniforms: new Map() };
-  // Keep the subgraph's per-node uniforms (recursively, incl. deeper groups) so the parent can surface them
-  // — without this the editor's live-tweak / offline re-render fast paths never see params inside a group.
-  // Nested groups compiled in here append their cache entries first, giving `cachePlan` bottom-up order.
-  const { outputs, uniforms } = compileDocument(
+  if (!sub) return { outputs: {}, uniforms: new Map(), usage: new Map() };
+  // Keep the subgraph's per-node uniforms + usage (recursively, incl. deeper groups) so the parent can
+  // surface them — without this the editor's live-tweak / offline re-render fast paths never see params
+  // inside a group. Nested groups compiled in here append their cache entries first (bottom-up cachePlan).
+  const { outputs, uniforms, usage } = compileDocument(
     sub, registry, opts, coord, cachePlan, derivativeCaches, externalInputs, solo,
   );
   const goNode = sub.nodes.find((n) => n.type === GROUP_OUTPUT_TYPE);
   const result: Record<string, MaterialValue> = {};
-  if (!goNode) return { outputs: result, uniforms };
+  if (!goNode) return { outputs: result, uniforms, usage };
   const subById = new Map(sub.nodes.map((n) => [n.id, n]));
   for (const p of nodePorts(goNode, registry).inputs) {
     const edge = sub.edges.find((e) => e.toNode === goNode.id && e.toInput === p.key);
@@ -551,7 +632,7 @@ function compileGroup(
       result[p.key] = value;
     }
   }
-  return { outputs: result, uniforms };
+  return { outputs: result, uniforms, usage };
 }
 
 // Surface-contract defaults shared by every material family (DoubleSide + polygon offset so the plane and

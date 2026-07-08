@@ -37,8 +37,7 @@ export const vectorMathNode: MaterialNodeDef = {
   build(ctx) {
     const a = ctx.inputs.vector1 ?? ctx.coord;
     const b = ctx.inputs.vector2 ?? vec3(0, 0, 0);
-    const s = ctx.uniforms.scale;
-    switch ((ctx.params.operation as string) ?? "add") {
+    switch ((ctx.constant("operation") as string) ?? "add") {
       case "subtract":
         return { vector: a.sub(b) };
       case "multiply":
@@ -58,7 +57,7 @@ export const vectorMathNode: MaterialNodeDef = {
       case "length":
         return { value: a.length() };
       case "scale":
-        return { vector: a.mul(s) };
+        return { vector: a.mul(ctx.live("scale")) };
       case "normalize":
         return { vector: a.normalize() };
       case "snap":

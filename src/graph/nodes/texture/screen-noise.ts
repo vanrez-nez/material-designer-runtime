@@ -25,9 +25,18 @@ export const screenNoiseNode: MaterialNodeDef = {
   build(ctx) {
     const coord = (ctx.inputs.coord ?? ctx.coord) as V;
     const uv2 = vec2(coord.x, coord.y) as V;
-    const noiseType = (ctx.params.noiseType as string) ?? "blue";
-    const px = uv2.mul(ctx.uniforms.resolution) as V; // pixel-space coordinate
+    const noiseType = (ctx.constant("noiseType") as string) ?? "blue";
 
+    // Scratches use their own coarse cell grid and never read `resolution` — wire the live pixel-density
+    // uniform ONLY in the pixel-hash branches below (conditional wiring: reading it here would falsely mark
+    // it live in a path that ignores it).
+    if (noiseType === "scratches") {
+      // Scratches read a coarser cell grid (their own density); fixed thinness so they're visible in the
+      // bake (the @lumiey fwidth-based thinness collapses to hairline at bake resolution).
+      return { field: scratches12(uv2.mul(5), float(3)) };
+    }
+
+    const px = uv2.mul(ctx.live("resolution")) as V; // pixel-space coordinate
     switch (noiseType) {
       case "hilbert-blue":
         return { field: hilbertBlue12(floor(px)) };
@@ -35,10 +44,6 @@ export const screenNoiseNode: MaterialNodeDef = {
         return { field: ign12(floor(px)) };
       case "golden-ign":
         return { field: goldenIgn12(floor(px)) };
-      case "scratches":
-        // Scratches read a coarser cell grid (their own density); fixed thinness so they're visible in the
-        // bake (the @lumiey fwidth-based thinness collapses to hairline at bake resolution).
-        return { field: scratches12(uv2.mul(5), float(3)) };
       case "blue":
       default:
         return { field: blue12(floor(px)) };

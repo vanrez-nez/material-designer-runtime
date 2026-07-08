@@ -22,9 +22,9 @@ export const fbmNode: MaterialNodeDef = {
   ],
   build(ctx) {
     // Blender multiplies the domain by Scale (larger Scale ⇒ finer features).
-    const p = (ctx.inputs.coord ?? ctx.coord).mul(ctx.uniforms.scale);
-    const octaves = (ctx.params.octaves as number) ?? 4;
-    const field = blenderFbm(p, octaves, ctx.uniforms.gain, ctx.uniforms.lacunarity);
+    const p = (ctx.inputs.coord ?? ctx.coord).mul(ctx.live("scale"));
+    const octaves = (ctx.constant("octaves") as number) ?? 4;
+    const field = blenderFbm(p, octaves, ctx.live("gain"), ctx.live("lacunarity"));
     return { field };
   },
 };

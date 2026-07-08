@@ -21,9 +21,9 @@ export const mappingNode: MaterialNodeDef = {
   ],
   build(ctx) {
     const v = ctx.inputs.vector ?? ctx.coord;
-    const type = Math.max(0, TYPES.indexOf(ctx.params.mappingType as string));
+    const type = Math.max(0, TYPES.indexOf(ctx.constant("mappingType") as string));
     return {
-      vector: blenderMapping(v, ctx.uniforms.location, ctx.uniforms.rotation, ctx.uniforms.scale, type),
+      vector: blenderMapping(v, ctx.live("location"), ctx.live("rotation"), ctx.live("scale"), type),
     };
   },
 };

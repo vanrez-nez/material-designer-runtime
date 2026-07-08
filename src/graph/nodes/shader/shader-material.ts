@@ -137,28 +137,27 @@ export const shaderMaterialNode: MaterialNodeDef = {
   },
   paramsFor,
   build(ctx): Record<string, MaterialValue> {
-    const t = normalizeMaterialType(ctx.params.materialType);
+    const t = normalizeMaterialType(ctx.constant("materialType"));
     const caps = MATERIAL_TYPE_CAPS[t];
-    const u = ctx.uniforms;
     // Connected input, else the param uniform (Blender's slider fallback).
-    const inOr = (k: string): MaterialValue => ctx.inputs[k] ?? u[k];
-    const num = (k: string): number => Number((ctx.params[k] as number) ?? NUM_DEFAULTS[k] ?? 0);
+    const inOr = (k: string): MaterialValue => ctx.inputs[k] ?? ctx.live(k);
+    const num = (k: string): number => Number((ctx.constant(k) as number) ?? NUM_DEFAULTS[k] ?? 0);
     // A physical lobe: connected input, else the param uniform only when the weight is non-zero.
     const lobe = (k: string): MaterialValue | undefined =>
-      ctx.inputs[k] !== undefined ? ctx.inputs[k] : num(k) > 0 ? u[k] : undefined;
+      ctx.inputs[k] !== undefined ? ctx.inputs[k] : num(k) > 0 ? ctx.live(k) : undefined;
 
     const emitConnected = ctx.inputs.emission !== undefined || ctx.inputs.emissionStrength !== undefined;
-    const emitActive = emitConnected || ((ctx.params.emission as string) ?? "#000000") !== "#000000";
+    const emitActive = emitConnected || ((ctx.constant("emission") as string) ?? "#000000") !== "#000000";
     const emission =
       caps.emissive && emitActive
-        ? (ctx.inputs.emission ?? u.emission).mul(ctx.inputs.emissionStrength ?? u.emissionStrength)
+        ? (ctx.inputs.emission ?? ctx.live("emission")).mul(ctx.inputs.emissionStrength ?? ctx.live("emissionStrength"))
         : undefined;
 
     const bundle: MaterialBundle = {
       baseColor: inOr("baseColor"),
       normal: ctx.inputs.normal, // undefined → interpolated geometry normal
       height: ctx.inputs.height, // input-only, offline parallax
-      alpha: ctx.inputs.alpha !== undefined ? ctx.inputs.alpha : num("alpha") < 1 ? u.alpha : undefined,
+      alpha: ctx.inputs.alpha !== undefined ? ctx.inputs.alpha : num("alpha") < 1 ? ctx.live("alpha") : undefined,
       emission,
     };
     if (caps.ao) bundle.ambientOcclusion = ctx.inputs.ambientOcclusion; // input-only detail AO

@@ -157,12 +157,32 @@ export type GraphChange =
 export interface BuildCtx {
   // Resolved upstream TSL node-values keyed by this node's input port key (undefined if unconnected).
   inputs: Record<string, MaterialValue | undefined>;
-  // Live-tweakable params as TSL uniform nodes (float / int / color). Updating `.value` re-renders
-  // without recompiling.
-  uniforms: Record<string, MaterialValue>;
-  // Raw param values, for build-time branching (bool/select) and loop counts (octaves) that cannot be
-  // dynamic uniforms.
-  params: Record<string, unknown>;
+
+  // --- Param accessors: the node↔pipeline contract (see memory: node-param-contract) -----------------
+  // A node MUST read every param through exactly one of these. The accessor you call declares the param's
+  // update category, and the pipeline routes edits off that record — no bakeStructural flag, no guessing.
+  // Misclassification is structurally impossible: reading the param IS the declaration.
+  //
+  // `live(key)` — the param is a GPU uniform: an edit updates its `.value` and re-renders WITHOUT a
+  // recompile (the seamless-tiling live-uniform fast path). Use for anything the shader samples continuously.
+  live(key: string): MaterialValue;
+  // `constant(key)` — the param is consumed at BUILD time (branching, loop counts, integer periods, CPU
+  // math). An edit re-runs build(). Returns the raw value (param default if unset).
+  constant(key: string): unknown;
+  // `constantArray(key, compute, elementType?)` — build-time array data (e.g. CPU-precomputed seeds). Returns
+  // a pipeline-OWNED, retained uniformArray so a same-length content change uploads in place (no stale
+  // buffer). An edit re-runs build(); `compute` only runs then. `elementType` defaults to "float".
+  constantArray(
+    key: string,
+    compute: () => ArrayLike<number>,
+    elementType?: "float" | "vec3",
+  ): MaterialValue;
+
+  // NOTE: there is deliberately NO raw `params` or `uniforms` bag. A node can only reach a param through the
+  // accessors above, so its update category is always recorded and can never be misclassified. Re-adding a
+  // raw bag (or any accessor that returns a value without recording) reopens the silent-staleness class this
+  // contract exists to close — don't (see memory: node-param-contract).
+
   // The coordinate domain: positionWorld (live, 3D seamless) or vec3(uv, 0) (offline, 2D tileable bake).
   coord: MaterialValue;
   backend: MaterialBackend;

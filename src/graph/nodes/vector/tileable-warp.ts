@@ -20,10 +20,10 @@ export const tileableWarpNode: MaterialNodeDef = {
   ],
   build(ctx) {
     const base = (ctx.inputs.coord ?? ctx.coord) as V;
-    const amount = ctx.uniforms.amount as V;
+    const amount = ctx.live("amount") as V;
 
     if (ctx.backend === "live") {
-      const p = base.div(Math.max(1, Number(ctx.params.scale ?? 4))) as V;
+      const p = base.div(Math.max(1, Number(ctx.constant("scale") ?? 4))) as V;
       const wx = mx_noise_float(p.add(vec3(11.3, 0, 0)));
       const wy = mx_noise_float(p.add(vec3(0, 47.7, 0)));
       const wz = mx_noise_float(p.add(vec3(0, 0, 93.1)));
@@ -31,7 +31,7 @@ export const tileableWarpNode: MaterialNodeDef = {
     }
     // offline: periodic warp over the uv tile. Period = scale (integer); decorrelate the two channels with
     // constant offsets (phase shifts that preserve periodicity).
-    const P = Math.max(1, Math.round(Number(ctx.params.scale ?? 4)));
+    const P = Math.max(1, Math.round(Number(ctx.constant("scale") ?? 4)));
     const uv = vec2(base.x, base.y) as V;
     const rep = vec2(P, P);
     const wx = pnoise2(uv.mul(P), rep);

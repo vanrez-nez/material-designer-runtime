@@ -29,7 +29,7 @@ export const rgbCurvesNode: MaterialNodeDef = {
   ],
   build(ctx) {
     const col = ctx.inputs.color ?? vec3(0, 0, 0);
-    const arr = ctx.uniforms.curves;
+    const arr = ctx.live("curves");
     // 5 control points per channel: C @0, R @5, G @10, B @15.
     const ch = (off: number): MaterialValue[] => [0, 1, 2, 3, 4].map((i) => arr.element(off + i));
     const [C, R, G, B] = [ch(0), ch(5), ch(10), ch(15)];
@@ -37,7 +37,7 @@ export const rgbCurvesNode: MaterialNodeDef = {
     const r = curve5(curve5(col.x, C), R);
     const g = curve5(curve5(col.y, C), G);
     const b = curve5(curve5(col.z, C), B);
-    const fac = ctx.inputs.fac ?? ctx.uniforms.fac;
+    const fac = ctx.inputs.fac ?? ctx.live("fac");
     return { color: mix(col, vec3(r, g, b), fac) };
   },
 };

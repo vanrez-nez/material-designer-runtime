@@ -20,9 +20,9 @@ export const colorRampNode: MaterialNodeDef = {
     const f = ctx.inputs.field ?? float(0.5);
     // Linear interpolation between the two stops (Blender ColorRamp's default), clamped outside [low,high].
     // (Was smoothstep, which softened the ramp differently from Blender.)
-    const lo = ctx.uniforms.low;
-    const hi = ctx.uniforms.high;
+    const lo = ctx.live("low");
+    const hi = ctx.live("high");
     const t = clamp(f.sub(lo).div(hi.sub(lo).max(1e-5)), 0, 1);
-    return { color: mix(ctx.uniforms.colorA, ctx.uniforms.colorB, t) };
+    return { color: mix(ctx.live("colorA"), ctx.live("colorB"), t) };
   },
 };

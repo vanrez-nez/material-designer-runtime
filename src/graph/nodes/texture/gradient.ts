@@ -16,8 +16,8 @@ export const gradientNode: MaterialNodeDef = {
     { key: "gradientType", label: "type", type: "select", options: TYPES, default: "linear" },
   ],
   build(ctx) {
-    const p = (ctx.inputs.coord ?? ctx.coord).mul(ctx.uniforms.scale);
-    const type = Math.max(0, TYPES.indexOf(ctx.params.gradientType as string));
+    const p = (ctx.inputs.coord ?? ctx.coord).mul(ctx.live("scale"));
+    const type = Math.max(0, TYPES.indexOf(ctx.constant("gradientType") as string));
     return { field: blenderGradient(p, type) };
   },
 };

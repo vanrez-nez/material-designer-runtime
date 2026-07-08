@@ -22,7 +22,7 @@ export const normalMapNode: MaterialNodeDef = {
   build(ctx) {
     // Default is a flat tangent-space normal (0.5, 0.5, 1) → decodes to (0,0,1) → unperturbed.
     const color = ctx.inputs.color ?? vec3(0.5, 0.5, 1);
-    const strength = ctx.inputs.strength ?? ctx.uniforms.strength;
+    const strength = ctx.inputs.strength ?? ctx.live("strength");
     return { normal: normalMap(color, strength) };
   },
 };

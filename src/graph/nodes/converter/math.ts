@@ -75,9 +75,9 @@ export const mathNode: MaterialNodeDef = {
   },
   build(ctx) {
     const a = ctx.inputs.a ?? float(0);
-    const b = ctx.inputs.b ?? ctx.uniforms.factor;
-    const c = ctx.inputs.c ?? ctx.uniforms.c;
-    switch (ctx.params.op as string) {
+    const b = ctx.inputs.b ?? ctx.live("factor");
+    const c = ctx.inputs.c ?? ctx.live("c");
+    switch (ctx.constant("op") as string) {
       // Functions
       case "add":
         return { field: a.add(b) };
@@ -168,7 +168,7 @@ export const mathNode: MaterialNodeDef = {
       // Non-Blender convenience
       case "mix":
       default:
-        return { field: mix(a, b, ctx.uniforms.factor) };
+        return { field: mix(a, b, ctx.live("factor")) };
     }
   },
 };

@@ -15,11 +15,11 @@ export const domainWarpNode: MaterialNodeDef = {
   ],
   build(ctx) {
     const base = ctx.inputs.coord ?? ctx.coord;
-    const p = base.div(ctx.uniforms.scale);
+    const p = base.div(ctx.live("scale"));
     // Decorrelated noise per axis (distinct lattice offsets keep the warp vector independent).
     const wx = mx_noise_float(p.add(vec3(11.3, 0, 0)));
     const wy = mx_noise_float(p.add(vec3(0, 47.7, 0)));
     const wz = mx_noise_float(p.add(vec3(0, 0, 93.1)));
-    return { coord: base.add(vec3(wx, wy, wz).mul(ctx.uniforms.amount)) };
+    return { coord: base.add(vec3(wx, wy, wz).mul(ctx.live("amount"))) };
   },
 };

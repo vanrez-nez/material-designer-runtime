@@ -37,9 +37,9 @@ export const combineXyzNode: MaterialNodeDef = {
     { key: "z", label: "z", type: "float", min: -10, max: 10, step: 0.01, default: 0 },
   ],
   build(ctx) {
-    const x = ctx.inputs.x ?? ctx.uniforms.x;
-    const y = ctx.inputs.y ?? ctx.uniforms.y;
-    const z = ctx.inputs.z ?? ctx.uniforms.z;
+    const x = ctx.inputs.x ?? ctx.live("x");
+    const y = ctx.inputs.y ?? ctx.live("y");
+    const z = ctx.inputs.z ?? ctx.live("z");
     return { vector: vec3(x, y, z) };
   },
 };

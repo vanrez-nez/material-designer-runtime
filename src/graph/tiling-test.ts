@@ -32,14 +32,16 @@ export interface TilingTestOptions {
 }
 
 // One noise type → a minimal graph: Tileable Noise (field) → Material (baseColor) → Material Output.
-function noiseDoc(noiseType: string): MaterialGraphDocument {
+// `params` is the resolved tileable-noise param set — an algorithm (`{ noiseType }`) or a Perlin preset
+// (`{ noiseType: "perlin-fbm", preset }`); the caller resolves which (see runTilingTest).
+function noiseDoc(params: Record<string, unknown>): MaterialGraphDocument {
   return {
-    version: 3,
+    version: 4,
     nodes: [
       {
         id: "n",
         type: "tileable-noise",
-        params: { noiseType, scale: 5, octaves: 4, gain: 0.5 },
+        params: { scale: 5, octaves: 4, gain: 0.5, ...params },
         position: { x: 0, y: 0 },
         enabled: true,
       },
@@ -92,12 +94,21 @@ export async function runTilingTest(
   const size = options.size ?? 256;
   const threshold = options.threshold ?? 3;
   const channel = options.channel ?? "baseColor";
-  const noiseType = registry.get("tileable-noise").params.find((p) => p.key === "noiseType");
-  const types = options.types ?? (noiseType?.options as string[] | undefined) ?? [];
+  // Default coverage = every algorithm, plus each Perlin preset (curl/paper/wool/stone/erosion — the
+  // compositions live behind `preset` now, so they must be exercised explicitly). A preset `type` compiles
+  // as perlin-fbm + that preset; anything else is an algorithm noiseType.
+  const nodeParams = registry.get("tileable-noise").params;
+  const algorithms = (nodeParams.find((p) => p.key === "noiseType")?.options as string[] | undefined) ?? [];
+  const presets = ((nodeParams.find((p) => p.key === "preset")?.options as string[] | undefined) ?? []).filter(
+    (p) => p !== "none",
+  );
+  const presetSet = new Set(presets);
+  const types = options.types ?? [...algorithms, ...presets];
 
   const results: SeamMetrics[] = [];
   for (const type of types) {
-    const graph = new MaterialGraphSession(noiseDoc(type), registry);
+    const params = presetSet.has(type) ? { noiseType: "perlin-fbm", preset: type } : { noiseType: type };
+    const graph = new MaterialGraphSession(noiseDoc(params), registry);
     const img = await service.readImage(graph, channel, size);
     if (!img) {
       results.push({

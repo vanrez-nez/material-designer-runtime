@@ -19,9 +19,9 @@ export const hueSatValNode: MaterialNodeDef = {
   build(ctx) {
     const col = ctx.inputs.color ?? vec3(0.8, 0.8, 0.8);
     const hsv = rgbToHsv(col);
-    const h = fract(hsv.x.add(ctx.uniforms.hue).add(0.5));
-    const s = hsv.y.mul(ctx.uniforms.saturation).clamp(0, 1);
-    const v = hsv.z.mul(ctx.uniforms.value);
-    return { color: mix(col, hsvToRgb(vec3(h, s, v)), ctx.uniforms.fac) };
+    const h = fract(hsv.x.add(ctx.live("hue")).add(0.5));
+    const s = hsv.y.mul(ctx.live("saturation")).clamp(0, 1);
+    const v = hsv.z.mul(ctx.live("value"));
+    return { color: mix(col, hsvToRgb(vec3(h, s, v)), ctx.live("fac")) };
   },
 };

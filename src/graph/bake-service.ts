@@ -10,8 +10,9 @@ import {
   makeChannelMaterial,
   COLOR_CHANNELS,
 } from "./channel-baker";
-import { countGraphNodes, type CacheEntry, type CacheSizing } from "./compiler";
+import { countGraphNodes, type CacheEntry, type CacheSizing, type ParamUsage } from "./compiler";
 import type { MaterialGraphSource, MaterialValue, PbrSocket } from "./types";
+import { uniformArray } from "three/tsl";
 
 // Single owner of all GPU texture baking (plan: "a single pipeline manager to bake the textures").
 // Decouples baking from any on-screen object: a material graph is baked into textures here, never by
@@ -143,6 +144,17 @@ export class BakedTextureSet {
   // Per-node param uniforms from the last compile (nodeId -> { paramKey -> uniform node }). The colorNodes
   // above reference these, so updating a uniform's `.value` and re-rendering reflects it with no recompile.
   uniforms: Map<string, Record<string, MaterialValue>> = new Map();
+  // How each node's build() consumed each param last compile (live vs constant) — the surface routes edits
+  // off this (see memory: node-param-contract). Replaces the bakeStructural heuristic.
+  paramUsage: ParamUsage = new Map();
+  // Retention store for ctx.constantArray: pipeline-OWNED uniformArray nodes kept ACROSS bakes, keyed by
+  // "nodeId/key". A same-length content change is written into the SAME node's `.array` (which uploads each
+  // render), so build-time data actually reaches the GPU — three won't rebuild node-builder state on an
+  // unchanged structural cache key (three.webgpu.js:30436), and a fresh array node would never be bound.
+  private readonly constArrays = new Map<
+    string,
+    { node: MaterialValue; length: number; elementType: "float" | "vec3" }
+  >();
   heightTarget: RenderTarget | null = null;
   hasHeight = false;
   // The set of channels that were actually connected at the last bake, plus a height flag — folded into a
@@ -277,6 +289,44 @@ export class BakedTextureSet {
   // bound is a WebGPU error ("Destroyed texture used in a submit"), so "Regenerate" re-bakes into the same
   // targets in place instead of swapping the set. The bake materials here are internal to baking (never on
   // the mesh), so disposing them is safe and makes the next bake rebuild them from scratch.
+  // ctx.constantArray backing store (injected into the compiler as opts.allocConstantArray). Returns a
+  // retained uniformArray for (nodeId, key): if one of the same length exists, copy the new contents into its
+  // `.array` in place (uploads on the next render — the same mechanism curve uniforms use) and hand back the
+  // SAME node so three keeps it bound; otherwise (first use / length changed = a real structural change)
+  // create a fresh one. Length changes flow through to a recompile via the normal build() path.
+  allocConstantArray(
+    nodeId: string,
+    key: string,
+    data: ArrayLike<number>,
+    elementType: "float" | "vec3",
+  ): MaterialValue {
+    const id = `${nodeId}/${key}`;
+    const existing = this.constArrays.get(id);
+    // Same length + element type → mutate the SAME node's `.array` in place (uploads next render) and reuse it.
+    // `.array` holds number primitives (float) or THREE.Vector3 objects (vec3); UniformArrayNode reads either.
+    if (existing && existing.length === data.length && existing.elementType === elementType) {
+      const arr = (existing.node as unknown as { array: unknown[] }).array;
+      if (elementType === "vec3") {
+        const vecs = arr as THREE.Vector3[];
+        for (let i = 0; i < vecs.length; i++) vecs[i].set(data[i * 3], data[i * 3 + 1], data[i * 3 + 2]);
+      } else {
+        const nums = arr as number[];
+        for (let i = 0; i < data.length; i++) nums[i] = data[i];
+      }
+      return existing.node;
+    }
+    let node: MaterialValue;
+    if (elementType === "vec3") {
+      const vecs: THREE.Vector3[] = [];
+      for (let i = 0; i < data.length; i += 3) vecs.push(new THREE.Vector3(data[i], data[i + 1], data[i + 2]));
+      node = uniformArray(vecs) as MaterialValue;
+    } else {
+      node = uniformArray(Array.from(data), "float") as MaterialValue;
+    }
+    this.constArrays.set(id, { node, length: data.length, elementType });
+    return node;
+  }
+
   flushCaches(): void {
     for (const m of this.mats.values()) m.dispose();
     this.mats.clear();
@@ -286,6 +336,8 @@ export class BakedTextureSet {
     this.cacheMats.clear();
     this.cachePlan = [];
     this.uniforms = new Map();
+    this.paramUsage = new Map();
+    this.constArrays.clear();
   }
 
   dispose(): void {
@@ -298,6 +350,9 @@ export class BakedTextureSet {
     for (const m of this.cacheMats.values()) m.dispose();
     this.cacheMats.clear();
     this.cachePlan = [];
+    this.uniforms = new Map();
+    this.paramUsage = new Map();
+    this.constArrays.clear();
     this.heightTarget?.dispose();
     this.heightTarget = null;
   }
@@ -405,15 +460,18 @@ export class MaterialBakeService {
       const tCompile0 = performance.now();
       // Decompose: each group's outputs are baked to their own intermediate textures (allocCache hands the
       // compiler the cache texture to sample downstream) so no channel shader inlines the whole graph.
-      const { bundle, uniforms, cachePlan } = graph.compileBundle({
+      const { bundle, uniforms, cachePlan, paramUsage } = graph.compileBundle({
         backend: "offline",
         soloNodeId: opts.soloNodeId,
         allocCache: (cacheId, _kind, sizing) =>
           set.cacheTexture(cacheId, cacheSizeFor(set.size, sizing), cacheWantsMips(sizing)),
+        allocConstantArray: (nodeId, key, data, elementType) =>
+          set.allocConstantArray(nodeId, key, data, elementType),
       });
       const compileMs = performance.now() - tCompile0;
       const nodeCount = countGraphNodes(graph.document);
       set.uniforms = uniforms; // retained so a uniform-only edit can re-render without recompiling
+      set.paramUsage = paramUsage; // retained so the surface routes edits (live vs rebuild) off real usage
       set.cachePlan = cachePlan; // retained so a uniform re-render regenerates caches in the same order
       // Prune caches orphaned by this compile (deleted/recreated groups, document switches). Skipped under
       // solo: a solo compile intentionally omits the group caches, and dropping them would force a full

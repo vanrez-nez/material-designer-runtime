@@ -26,11 +26,11 @@ export const checkerNode: MaterialNodeDef = {
     { key: "scale", label: "scale", type: "float", min: 0.5, max: 32, step: 0.5, default: 4 },
   ],
   build(ctx) {
-    const p = (ctx.inputs.coord ?? ctx.coord).mul(ctx.uniforms.scale) as V;
+    const p = (ctx.inputs.coord ?? ctx.coord).mul(ctx.live("scale")) as V;
     const parity = mod(floor(p.x).add(floor(p.y)).add(floor(p.z)), 2) as V; // 0 → color1, 1 → color2
     const isC1 = parity.lessThan(1) as V;
-    const c1 = (ctx.inputs.color1 ?? ctx.uniforms.color1) as V;
-    const c2 = (ctx.inputs.color2 ?? ctx.uniforms.color2) as V;
+    const c1 = (ctx.inputs.color1 ?? ctx.live("color1")) as V;
+    const c2 = (ctx.inputs.color2 ?? ctx.live("color2")) as V;
     return { color: select(isC1, c1, c2), fac: select(isC1, float(1), float(0)) };
   },
 };

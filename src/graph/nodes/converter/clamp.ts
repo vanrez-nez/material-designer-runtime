@@ -20,9 +20,9 @@ export const clampNode: MaterialNodeDef = {
   ],
   build(ctx) {
     const v = ctx.inputs.value ?? float(0);
-    const lo = ctx.inputs.min ?? ctx.uniforms.min;
-    const hi = ctx.inputs.max ?? ctx.uniforms.max;
-    if ((ctx.params.mode as string) === "range") {
+    const lo = ctx.inputs.min ?? ctx.live("min");
+    const hi = ctx.inputs.max ?? ctx.live("max");
+    if ((ctx.constant("mode") as string) === "range") {
       // clamp to [min(lo,hi), max(lo,hi)] — handles a reversed range.
       return { field: v.clamp(min(lo, hi), max(lo, hi)) };
     }

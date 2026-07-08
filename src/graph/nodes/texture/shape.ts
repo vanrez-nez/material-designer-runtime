@@ -31,13 +31,13 @@ export const shapeNode: MaterialNodeDef = {
   build(ctx) {
     const coord = (ctx.inputs.coord ?? ctx.coord) as V;
     const seed = ctx.inputs.seed as V | undefined;
-    const shape = (ctx.params.shape as string) ?? "blob";
-    const rawSides = Math.round(Number(ctx.params.sides ?? 6));
+    const shape = (ctx.constant("shape") as string) ?? "blob";
+    const rawSides = Math.round(Number(ctx.constant("sides") ?? 6));
     const sides = Number.isFinite(rawSides) ? Math.max(3, rawSides) : 6;
     const { mask, height } = shapeField(coord, shape, sides, seed ?? null, {
-      irregularity: ctx.uniforms.irregularity as V,
-      dome: ctx.uniforms.dome as V,
-      edge: ctx.uniforms.edge as V,
+      irregularity: ctx.live("irregularity") as V,
+      dome: ctx.live("dome") as V,
+      edge: ctx.live("edge") as V,
     });
     return { mask, height };
   },

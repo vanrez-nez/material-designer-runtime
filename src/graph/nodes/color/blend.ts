@@ -27,7 +27,7 @@ export const blendNode: MaterialNodeDef = {
     const a = ctx.inputs.a ?? color(0x000000);
     const b = ctx.inputs.b ?? color(0xffffff);
     let blended;
-    switch (ctx.params.mode as string) {
+    switch (ctx.constant("mode") as string) {
       case "multiply":
         blended = a.mul(b);
         break;
@@ -42,7 +42,7 @@ export const blendNode: MaterialNodeDef = {
         blended = b;
         break;
     }
-    const m = (ctx.inputs.mask ?? float(1)).mul(ctx.uniforms.opacity);
+    const m = (ctx.inputs.mask ?? float(1)).mul(ctx.live("opacity"));
     return { color: mix(a, blended, m) };
   },
 };

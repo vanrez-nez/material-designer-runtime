@@ -10,7 +10,7 @@ import {
   type ParamDef,
 } from "./graph/types";
 
-export const MATERIAL_DOCUMENT_VERSION = 3;
+export const MATERIAL_DOCUMENT_VERSION = 4;
 
 export function cloneMaterialDocument(doc: MaterialGraphDocument): MaterialGraphDocument {
   return structuredClone(doc);
@@ -34,10 +34,25 @@ function migrateNodesToV3(doc: MaterialGraphDocument): void {
   }
 }
 
+// v3 → v4: the tileable-noise "noiseType" selector used to conflate genuine algorithms with Perlin
+// compositions (curl/paper/wool/stone/erosion — all derived from the curl of Perlin). Those five move out of
+// the algorithm list into a Perlin-scoped `preset` param. Rewrite each legacy node to perlin-fbm + the
+// matching preset, recursing into group subgraphs. Idempotent — a v4 doc has no matching noiseType values.
+const TILEABLE_NOISE_PRESETS = new Set(["curl", "paper", "wool", "stone", "erosion"]);
+function migrateNodesToV4(doc: MaterialGraphDocument): void {
+  for (const node of doc.nodes) {
+    if (node.type === "tileable-noise" && TILEABLE_NOISE_PRESETS.has(node.params.noiseType as string)) {
+      node.params = { ...node.params, preset: node.params.noiseType, noiseType: "perlin-fbm" };
+    }
+    if (node.subgraph) migrateNodesToV4(node.subgraph);
+  }
+}
+
 export function migrateMaterialDocument(doc: MaterialGraphDocument): MaterialGraphDocument {
   const next = cloneMaterialDocument(doc);
-  // A missing version is treated as pre-v3 (legacy); the rewrite is idempotent so this is always safe.
+  // A missing version is treated as pre-v3 (legacy); every step is idempotent so this is always safe.
   if ((doc.version ?? 0) < 3) migrateNodesToV3(next);
+  if ((doc.version ?? 0) < 4) migrateNodesToV4(next);
   next.version = MATERIAL_DOCUMENT_VERSION;
   return next;
 }

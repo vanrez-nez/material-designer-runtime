@@ -1,5 +1,4 @@
-import { uniformArray, int, float, floor, max } from "three/tsl";
-import { Vector3 } from "three";
+import { int, float, floor, max, smoothstep } from "three/tsl";
 import type { MaterialNodeDef, MaterialValue, PortDef } from "../../types";
 import {
   blenderVoronoiF1,
@@ -28,8 +27,11 @@ const FULL_OUTPUTS: PortDef[] = [
 ];
 // Distance-to-Edge has no per-cell Colour output, so it carries a scalar per-cell `Random` instead — one
 // constant value per cell (for per-tile tint variation), aligned to the (relaxed) cell tessellation.
+// `Edges` is a ready-to-use border MASK: the raw `Distance` field thresholded by `edgeWidth` (1 on the edge,
+// falling to 0 in the cell interior). `Distance` stays raw so downstream ramps/thresholds keep working.
 const EDGE_OUTPUTS: PortDef[] = [
   { key: "distance", label: "Distance", kind: "float" },
+  { key: "edges", label: "Edges", kind: "float" },
   { key: "random", label: "Random", kind: "float" },
 ];
 const COORD_INPUT: PortDef[] = [{ key: "coord", kind: "vector" }];
@@ -67,6 +69,9 @@ export const voronoiNode: MaterialNodeDef = {
     { key: "feature", label: "feature", type: "select", options: FEATURES, default: "f1" },
     { key: "exponent", label: "exponent", type: "float", min: 0.1, max: 8, step: 0.1, default: 2 },
     { key: "smoothness", label: "smoothness", type: "float", min: 0, max: 1, step: 0.01, default: 0.25 },
+    // Border thickness for the `edges` output (distance-to-edge only). A LIVE uniform: it only feeds the final
+    // smoothstep, so it stays draggable even in the relaxed path (where scale/randomness are build-time seeds).
+    { key: "edgeWidth", label: "edge width", type: "float", min: 0.005, max: 0.5, step: 0.005, default: 0.05 },
     // Lloyd relaxation iterations for natural (centroidal) cells — offline + distance-to-edge only. 0 keeps
     // the faithful jittered-grid Voronoi; 2–4 give equiaxed, sliver-free, non-square mud-crack cells.
     { key: "relax", label: "relax", type: "int", min: 0, max: 5, step: 1, default: 0 },
@@ -81,66 +86,93 @@ export const voronoiNode: MaterialNodeDef = {
   paramsFor(params) {
     const metric = (params.metric as string) ?? "euclidean";
     const feature = (params.feature as string) ?? "f1";
+    const relax = Math.round(Number(params.relax ?? 0));
     const show = new Set(["scale", "randomness", "metric", "feature"]);
     if (metric === "minkowski") show.add("exponent");
     if (feature === "smooth-f1") show.add("smoothness");
-    if (feature === "distance-to-edge") show.add("relax");
-    return voronoiNode.params.filter((p) => show.has(p.key));
+    if (feature === "distance-to-edge") {
+      show.add("relax");
+      show.add("edgeWidth");
+    }
+    // In the relaxed distance-to-edge path, `scale` (→ period) and `randomness` (→ initial jitter) are consumed
+    // at BUILD time to precompute the CPU Lloyd seed set (see build()) — they are NOT live shader uniforms
+    // there. So an edit to either must force a re-bake (bakeStructural), not the default live-uniform
+    // re-render, which would update uniforms the relaxed shader never reads → no visible change. Everywhere
+    // else they stay live uniforms so normal Voronoi drags smoothly.
+    const buildTimeSeeds = feature === "distance-to-edge" && relax > 0;
+    return voronoiNode.params
+      .filter((p) => show.has(p.key))
+      .map((p) =>
+        buildTimeSeeds && (p.key === "scale" || p.key === "randomness")
+          ? { ...p, bakeStructural: true }
+          : p,
+      );
   },
   build(ctx) {
+    // Param contract (see memory: node-param-contract): metric/feature/relax are build-time selects/ints
+    // (structural); read via ctx.constant. The live float uniforms (randomness/exponent/smoothness/scale)
+    // are read via ctx.live ONLY in the non-relaxed path below — the relaxed path never wires them, so
+    // reading them here would falsely mark them live and misroute an edit to a no-op re-render.
     const offline = ctx.backend === "offline";
-    const m = Math.max(0, METRICS.indexOf(ctx.params.metric as string));
-    const r = ctx.uniforms.randomness;
-    const e = ctx.uniforms.exponent;
-    const s = ctx.uniforms.smoothness;
-    const feature = (ctx.params.feature as string) ?? "f1";
+    const m = Math.max(0, METRICS.indexOf(ctx.constant("metric") as string));
+    const feature = (ctx.constant("feature") as string) ?? "f1";
     const coordIn = ctx.inputs.coord ?? ctx.coord;
 
     // Lloyd-relaxed cells: offline + distance-to-edge only. Precompute a periodic relaxed seed set on the
-    // CPU (sized period²) and hand it to the shader as a uniformArray; the relaxed neighbour search reads
-    // those offsets instead of the PCG hash (same cost, GPU-safe). Because the seed array is sized by the
-    // period, `scale` (→ period) and `randomness` (→ initial jitter) are BUILD-TIME here — a live edit to
-    // either only re-tessellates after a structural change (e.g. toggling `relax`), unlike the paths below.
-    const relax = Math.max(0, Math.round(Number(ctx.params.relax ?? 0)));
+    // CPU (sized period²) and hand it to the shader as a RETAINED uniformArray (ctx.constantArray) so a
+    // same-length re-tessellation uploads in place. `scale` (→ period) and `randomness` (→ initial jitter)
+    // are BUILD-TIME here (ctx.constant) — an edit re-runs build() and recomputes the seeds. A period change
+    // (different array length) is a genuine structural change.
+    const relax = Math.max(0, Math.round(Number(ctx.constant("relax") ?? 0)));
     if (feature === "distance-to-edge" && offline && relax > 0) {
-      const period = Math.max(1, Math.round(Number(ctx.params.scale ?? 1)));
+      const period = Math.max(1, Math.round(Number(ctx.constant("scale") ?? 1)));
+      const rnd = Number(ctx.constant("randomness") ?? 1);
       const p = coordIn.mul(period);
-      const data = relaxedCellOffsets(period, Number(ctx.params.randomness ?? 1), relax);
-      const vecs: Vector3[] = [];
-      for (let n = 0; n < period * period; n++)
-        vecs.push(new Vector3(data[n * 3], data[n * 3 + 1], data[n * 3 + 2]));
-      const seeds = uniformArray(vecs);
+      const seeds = ctx.constantArray("seeds", () => relaxedCellOffsets(period, rnd, relax), "vec3");
       const wrap = (v: MaterialValue): MaterialValue =>
         v.sub(int(floor(float(v).div(period))).mul(int(period)));
       const seedFn = (ix: MaterialValue, iy: MaterialValue): MaterialValue =>
         seeds.element(wrap(iy).mul(period).add(wrap(ix))) as MaterialValue;
-      // Per-cell random tint: same relaxed seeds, so it lines up with the crack cells exactly.
-      const randoms = uniformArray(cellRandomValues(period * period));
+      // Per-cell random tint: same relaxed cell tessellation, so it lines up with the crack cells exactly.
+      const randoms = ctx.constantArray("randoms", () => cellRandomValues(period * period), "float");
       const valueFn = (ix: MaterialValue, iy: MaterialValue): MaterialValue =>
         randoms.element(wrap(iy).mul(period).add(wrap(ix))) as MaterialValue;
+      // edgeWidth IS wired here (into the border smoothstep), so ctx.live is correct — unlike scale/randomness
+      // it is a genuine live uniform in the relaxed path too.
+      const wEdge = ctx.live("edgeWidth") as MaterialValue;
+      const edgeDist = relaxedVoronoiDistanceToEdge(p, seedFn) as MaterialValue;
       return {
-        distance: relaxedVoronoiDistanceToEdge(p, seedFn),
+        distance: edgeDist,
+        edges: smoothstep(float(0), wEdge, edgeDist).oneMinus() as MaterialValue,
         random: relaxedVoronoiCellValue(p, seedFn, valueFn),
       };
     }
 
+    // Non-relaxed: these ARE live uniforms wired into the shader → ctx.live (edit → re-render, no recompile).
+    const r = ctx.live("randomness");
+    const e = ctx.live("exponent");
+    const s = ctx.live("smoothness");
+    const wEdge = ctx.live("edgeWidth") as MaterialValue;
     // Offline bakes a 2D uv tile: round the LIVE scale uniform to an INTEGER period in-shader and wrap the
     // cell hash to it so the cells repeat seamlessly across the tile edge — yet a scale edit re-renders
     // without recompiling. Live is a seamless 3D field (positionWorld): period 0 keeps the faithful Blender
     // path, scaled by the raw (continuous) scale uniform.
-    const scaleU = ctx.uniforms.scale as MaterialValue;
+    const scaleU = ctx.live("scale") as MaterialValue;
     const periodU = max(floor(scaleU.add(0.5)), float(1)) as MaterialValue;
     const p = coordIn.mul(offline ? periodU : scaleU);
     const period: number | MaterialValue = offline ? periodU : 0;
 
     switch (feature) {
-      case "distance-to-edge":
+      case "distance-to-edge": {
         // Un-relaxed distance-to-edge shares the jittered-grid seeds with F1, so F1's per-cell colour hash
         // aligns with these cells — use its red channel as the per-cell random.
+        const edgeDist = blenderVoronoiDistanceToEdge(p, r, period) as MaterialValue;
         return {
-          distance: blenderVoronoiDistanceToEdge(p, r, period),
+          distance: edgeDist,
+          edges: smoothstep(float(0), wEdge, edgeDist).oneMinus() as MaterialValue,
           random: blenderVoronoiF1Color(p, r, m, e, period).x,
         };
+      }
       case "f2":
         return {
           distance: blenderVoronoiF2(p, r, m, e, period),

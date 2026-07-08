@@ -19,8 +19,8 @@ export const brightContrastNode: MaterialNodeDef = {
   ],
   build(ctx) {
     const col = ctx.inputs.color ?? vec3(0, 0, 0);
-    const contrast = ctx.inputs.contrast ?? ctx.uniforms.contrast;
-    const bright = ctx.inputs.bright ?? ctx.uniforms.bright;
+    const contrast = ctx.inputs.contrast ?? ctx.live("contrast");
+    const bright = ctx.inputs.bright ?? ctx.live("bright");
     const a = float(1).add(contrast);
     const b = bright.sub(contrast.mul(0.5));
     return { color: col.mul(a).add(b).max(0) };

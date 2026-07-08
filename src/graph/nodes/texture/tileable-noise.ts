@@ -20,23 +20,17 @@ import {
 
 type V = MaterialValue;
 
-// Noise types selectable on this node. "perlin-fbm" is the DEFAULT and reproduces the original Tileable
-// Noise output verbatim (existing presets are unaffected). The rest are seamless (period-wrapped) variants
-// of the @lumiey noise library — each tiles in the offline bake. New types are added here over time.
-const NOISE_TYPES = [
-  "perlin-fbm",
-  "value",
-  "worley",
-  "voronoi-smooth",
-  "gabor",
-  "stone",
-  "paper",
-  "wool",
-  "simplex",
-  "wavelet",
-  "erosion",
-  "curl",
-];
+// The genuine, irreducible noise ALGORITHMS selectable on this node — each a distinct generative primitive.
+// "perlin-fbm" is the DEFAULT and reproduces the original Tileable Noise output verbatim. The rest are
+// seamless (period-wrapped) variants of the @lumiey noise library — each tiles in the offline bake.
+// NOTE: curl/paper/wool/stone/erosion are deliberately NOT here — they are not algorithms but COMPOSITIONS
+// of Perlin (all derived from curlVec2, the curl of periodic Perlin: curl = the flow field, paper/wool =
+// two norms of it, stone = Perlin warped by it, erosion = stone + a ridge). They live in PRESET_TYPES and
+// are surfaced as a "preset" selector under Perlin (see paramsFor); build() dispatches a Perlin+preset
+// selection to the existing composition via effType, so the composed looks are reproduced verbatim.
+const ALGORITHM_TYPES = ["perlin-fbm", "value", "worley", "voronoi-smooth", "gabor", "simplex", "wavelet"];
+// Perlin compositions, exposed as presets when the algorithm is perlin-fbm. "none" = raw Perlin fBm.
+const PRESET_TYPES = ["none", "curl", "paper", "wool", "stone", "erosion"];
 
 // Context-sensitive controls per noiseType: which OPTIONAL param keys actually take effect (see paramsFor).
 // `noiseType` + `scale` are always shown. fBm types (perlin/value/cellular/flow/simplex/wavelet/erosion) share
@@ -98,7 +92,11 @@ export const tileableNoiseNode: MaterialNodeDef = {
   inputs: [{ key: "coord", kind: "vector" }],
   outputs: [{ key: "field", kind: "float" }],
   params: [
-    { key: "noiseType", label: "type", type: "select", options: NOISE_TYPES, default: "perlin-fbm" },
+    { key: "noiseType", label: "algorithm", type: "select", options: ALGORITHM_TYPES, default: "perlin-fbm" },
+    // Perlin presets (curl/paper/wool/stone/erosion) — compositions on the Perlin base, shown only when the
+    // algorithm is perlin-fbm (see paramsFor). "none" = plain Perlin fBm. Each maps to an existing dispatch
+    // key via effType in build(), so the composed looks are reproduced verbatim.
+    { key: "preset", label: "preset", type: "select", options: PRESET_TYPES, default: "none" },
     // `scale` is a live uniform (float, integer-stepped): the offline bake rounds it to an integer period
     // IN-SHADER (so the lattice still tiles) but reads it as a uniform — a scale edit re-renders the baked
     // channels WITHOUT recompiling (the fast path), and finer grain is reachable at the higher max. It must
@@ -129,19 +127,29 @@ export const tileableNoiseNode: MaterialNodeDef = {
     // `curl` (vector) output is never tiled.
     { key: "tileSize", label: "tile", type: "select", options: ["off", "64", "128", "256", "512"], default: "off" },
   ],
-  // curl adds a `vector` output (the flow field); all other types expose just `field`.
+  // The curl preset (Perlin + preset "curl") adds a `vector` output (the flow field); everything else exposes
+  // just `field`.
   declare(params) {
     const inputs = [{ key: "coord", kind: "vector" as const }];
     return {
       inputs,
-      outputs: (params.noiseType as string) === "curl" ? FIELD_AND_VECTOR : FIELD_ONLY,
+      outputs:
+        (params.noiseType as string) === "perlin-fbm" && (params.preset as string) === "curl"
+          ? FIELD_AND_VECTOR
+          : FIELD_ONLY,
     };
   },
-  // Context-sensitive controls: show `noiseType` + `scale` always, then only the params that take effect for
-  // the selected noiseType (see NOISE_CAPS). Editor-only filter — the compiler still builds every uniform.
+  // Context-sensitive controls: show `noiseType` + `scale` always; show `preset` only under Perlin; then only
+  // the params that take effect for the effective type (algorithm, or the active Perlin preset — see
+  // NOISE_CAPS). Editor-only filter — the compiler still builds every uniform.
   paramsFor(params) {
-    const caps = NOISE_CAPS[(params.noiseType as string) ?? "perlin-fbm"] ?? [];
+    const noiseType = (params.noiseType as string) ?? "perlin-fbm";
+    const preset = (params.preset as string) ?? "none";
+    // Presets are Perlin-only: effType picks the composition's caps when a preset is active under Perlin.
+    const effType = noiseType === "perlin-fbm" && preset !== "none" ? preset : noiseType;
+    const caps = NOISE_CAPS[effType] ?? [];
     const show = new Set(["noiseType", "scale", ...caps]);
+    if (noiseType === "perlin-fbm") show.add("preset"); // preset selector only under Perlin
     return tileableNoiseNode.params.filter((p) => show.has(p.key));
   },
   build(ctx) {
@@ -149,23 +157,30 @@ export const tileableNoiseNode: MaterialNodeDef = {
     // Guard against a non-finite octaves field (empty editor input → NaN): octaves is a build-time loop
     // count, so a bad value here would just unroll wrong — clamp it. (scale/aspect are uniforms now; the
     // compiler already NaN-guards uniform seeds, so no build-time coercion is needed for them.)
-    const octaves = Math.max(1, Math.round(Number.isFinite(Number(ctx.params.octaves)) ? Number(ctx.params.octaves) : 4));
-    // Lacunarity is a build-time WHOLE number offline (integer octave periods → seamless tiling); rounded here.
-    const lac = Math.max(2, Math.round(Number.isFinite(Number(ctx.params.lacunarity)) ? Number(ctx.params.lacunarity) : 2));
-    const noiseType = (ctx.params.noiseType as string) ?? "perlin-fbm";
-    const gain = ctx.uniforms.gain as V;
-    const scaleU = ctx.uniforms.scale as V; // live uniform (float)
+    const octaves = Math.max(1, Math.round(Number.isFinite(Number(ctx.constant("octaves"))) ? Number(ctx.constant("octaves")) : 4));
+    const noiseType = (ctx.constant("noiseType") as string) ?? "perlin-fbm";
+    const preset = (ctx.constant("preset") as string) ?? "none";
+    // Perlin presets (curl/paper/wool/stone/erosion) are compositions of Perlin: dispatch them via effType,
+    // which maps a Perlin+preset selection to the composition's existing build branch/base. Any other
+    // algorithm (or preset "none") dispatches on the algorithm itself. Live backend ignores this (blenderFbm).
+    const effType = noiseType === "perlin-fbm" && preset !== "none" ? preset : noiseType;
+    const gain = ctx.live("gain") as V;
+    const scaleU = ctx.live("scale") as V; // live uniform (float)
 
     if (ctx.backend === "live") {
       // No tiling in the seamless-3D preview; reuse the Blender fBm over the world coordinate for every type.
       // scale stays a continuous live uniform here (no integer period needed off the tile). Lacunarity is a
       // continuous live uniform here (the integer constraint only applies to the seamless offline tile).
       const p = coord.mul(scaleU) as V;
-      return { field: blenderFbm(p, octaves, gain, ctx.uniforms.lacunarity as V) };
+      return { field: blenderFbm(p, octaves, gain, ctx.live("lacunarity") as V) };
     }
 
+    // Lacunarity is a build-time WHOLE number offline (integer octave periods → seamless tiling), read via
+    // ctx.constant HERE (after the live return) so the live backend records it as the continuous live uniform
+    // above and offline records it constant — the accessor differs per backend, routing is correct per compile.
+    const lac = Math.max(2, Math.round(Number.isFinite(Number(ctx.constant("lacunarity"))) ? Number(ctx.constant("lacunarity")) : 2));
     const uv2 = vec2(coord.x, coord.y) as V;
-    const aaU = ctx.uniforms.antialias as V; // live band-limit strength (0..1)
+    const aaU = ctx.live("antialias") as V; // live band-limit strength (0..1)
     // Repeating-unit tiling (offline): the compiler renders `period / tileRepeat` periods into a small buffer
     // and repeats it ×tileRepeat, so dividing the period here keeps the final feature size = `scale` (constant)
     // while the block repeats. 1 = no tiling (full render). See compiler maybeTileNode / tileRepeatFor.
@@ -175,16 +190,16 @@ export const tileableNoiseNode: MaterialNodeDef = {
     // IN-SHADER (so a scale drag re-renders without recompiling, yet the lattice at index `period` matches 0).
     const periodU = max(floor(scaleTiled.add(0.5)), float(1)) as V;
     // aspect stretches the X period (perlin/value); keep it integer so X tiles too.
-    const aspectU = ctx.uniforms.aspect as V;
+    const aspectU = ctx.live("aspect") as V;
     const periodXU = max(floor(periodU.mul(aspectU).add(0.5)), float(1)) as V;
 
-    if (noiseType === "curl") {
+    if (effType === "curl") {
       // Vector flow field (single sample at the base period); `field` = its magnitude.
       const c = curlVec(uv2.mul(periodU), periodU, periodU) as V;
       return { field: c.length(), vector: c };
     }
 
-    if (noiseType === "simplex") {
+    if (effType === "simplex") {
       // psrdnoise's sheared simplex lattice only tiles in Y when the period is EVEN — an odd period shifts
       // the skewed x-index by a half cell across the y-wrap, leaving a vertical seam. Snap the period up to
       // even (every octave period stays even since it's ×2^o): even = period + (period mod 2).
@@ -192,20 +207,20 @@ export const tileableNoiseNode: MaterialNodeDef = {
       return { field: periodicFbm01(uv2, evenU, evenU, octaves, gain, simplexBase01, aaU, lac) };
     }
 
-    if (noiseType === "gabor") {
+    if (effType === "gabor") {
       // Faithful Blender Gabor (sparse convolution) — its own frequency/anisotropy/orientation controls; it is
       // NOT an fBm base, so octaves/gain/aspect/antialias don't apply. isotropy = 1 − anisotropy. `periodU`
       // (integer scale, tile-divided) sets the cell count so it stays seamless + tileable.
-      const isotropy = float(1).sub(ctx.uniforms.gaborAniso as V) as V;
+      const isotropy = float(1).sub(ctx.live("gaborAniso") as V) as V;
       return {
-        field: gaborValue2D(uv2, periodU, ctx.uniforms.gaborFreq as V, isotropy, ctx.uniforms.gaborOrient as V),
+        field: gaborValue2D(uv2, periodU, ctx.live("gaborFreq") as V, isotropy, ctx.live("gaborOrient") as V),
       };
     }
 
-    const base = OFFLINE_BASES[noiseType];
+    const base = OFFLINE_BASES[effType];
     if (base) {
       // Cellular/flow types ignore aspect (square period); value supports it (anisotropic per-axis period).
-      const periodX = noiseType === "value" ? periodXU : periodU;
+      const periodX = effType === "value" ? periodXU : periodU;
       return { field: periodicFbm01(uv2, periodX, periodU, octaves, gain, base, aaU, lac) };
     }
     // Default "perlin-fbm": original bespoke path — periodic fBm over the uv tile. aspect elongates along Y.

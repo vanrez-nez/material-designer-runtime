@@ -283,12 +283,15 @@ export class TexturedSurface {
     return true;
   }
 
-  // Offline backend: update the retained uniform that the last bake's channel materials reference. Returns
-  // false if there's no matching uniform (structural param, or no bake has happened yet) → caller re-bakes.
+  // Offline backend: decide fast re-render (true) vs full re-bake (false) for a param edit, and if fast,
+  // update the retained uniform in place. Routes off the node↔pipeline contract: `paramUsage` records how
+  // build() actually consumed the param last compile (see memory: node-param-contract) — the single source
+  // of truth, so a build-time param can't be misrouted to a no-op re-render.
   private updateOfflineUniform(change: Extract<GraphChange, { kind: "param" }>): boolean {
-    // Build-time-in-offline floats (e.g. Voronoi scale/randomness, noise aspect) aren't live uniforms in the
-    // bake — updating one wouldn't change the output, so force a re-bake instead of a (no-op) re-render.
-    if (change.bakeStructural) return false;
+    // Route purely off the contract: build() recorded how it consumed this param last compile. Only a param
+    // it wired as a live uniform takes the fast in-place update; anything build-time (or unconsumed) re-bakes.
+    const usage = this.set.paramUsage.get(change.nodeId)?.[change.key];
+    if (usage !== "live") return false;
     const u = this.set.uniforms.get(change.nodeId)?.[change.key];
     if (!u) return false;
     this.applyUniformValue(u, change);

@@ -21,9 +21,9 @@ export const anisotropicStripesNode: MaterialNodeDef = {
   build(ctx) {
     const domain = ctx.inputs.coord ?? ctx.coord;
     const around = atan(domain.z, domain.x).div(TAU); // -0.5..0.5 around the trunk
-    const wav = mx_noise_float(vec3(domain.y.mul(0.6), around.mul(6), float(0))).mul(ctx.uniforms.waviness);
-    const phase = around.mul(ctx.uniforms.count).add(wav);
+    const wav = mx_noise_float(vec3(domain.y.mul(0.6), around.mul(6), float(0))).mul(ctx.live("waviness"));
+    const phase = around.mul(ctx.live("count")).add(wav);
     const stripe = phase.mul(TAU).sin().mul(0.5).add(0.5);
-    return { field: stripe.pow(ctx.uniforms.sharpness).mul(ctx.uniforms.contrast) };
+    return { field: stripe.pow(ctx.live("sharpness")).mul(ctx.live("contrast")) };
   },
 };

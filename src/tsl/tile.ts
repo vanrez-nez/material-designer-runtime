@@ -3,6 +3,8 @@ import {
   float,
   int,
   vec2,
+  vec3,
+  vec4,
   floor,
   mod,
   min,
@@ -50,16 +52,29 @@ export interface TileUniforms {
 export interface TileResult {
   mask: V; // 1 inside a tile, 0 in the gap/grout
   value: V; // per-tile random value [0,1] → colour / roughness / luminance variation
+  // Fragment position LOCAL to the winning tile, in cell units (~[-0.5,0.5]), z = 0. The rotatable
+  // per-tile coordinate — feed it through Vector Rotate (angle from cellRandom) to give each tile its own
+  // oriented detail (e.g. wood grain). Resets per cell, so it is inherently seamless across the bake tile.
+  cellCoord: V;
+  // Three DECORRELATED per-tile randoms in [0,1) (x/y/z) from a fresh hash seed — for independent per-tile
+  // angle / brightness / phase without stealing the `value` channel. Computed through the WRAPPED cell hash
+  // (periods C, R) so cell C ≡ cell 0 and anything derived from it stays periodic across the tile edge.
+  cellRandom: V;
 }
 
 export function tilePattern(coord: V, grid: TileGrid, u: TileUniforms): TileResult {
   const { columns: C, rows: R, offsetFreq: F } = grid;
-  // An Fn returns a single node, so pack (mask, value) into a vec2 and unpack after.
+  const g = vec2(coord.x.mul(C), coord.y.mul(R)) as V; // grid space (unit cells) — reused below
+
+  // An Fn returns a single node, so the stateful 3×3 winner search packs (mask, value, cellX, cellY) into a
+  // vec4 and unpacks after. Only the winning cell INDEX is carried out of the loop; cellCoord / cellRandom
+  // are derived from it below (cheap, no iteration) — this keeps the loop a single pass.
   const packed = Fn(() => {
-    const g = vec2(coord.x.mul(C), coord.y.mul(R)) as V; // grid space (unit cells)
     const baseRow = floor(g.y) as V;
     const best = float(-1e9).toVar(); // winning tile insideness (-SDF; >0 inside)
     const bestVal = float(0).toVar();
+    const bestCx = float(0).toVar(); // winning cell index (float), for per-cell coord/random below
+    const bestCy = float(0).toVar();
 
     for (let dy = -1; dy <= 1; dy++) {
       const cyf = baseRow.add(dy) as V;
@@ -106,14 +121,34 @@ export function tilePattern(coord: V, grid: TileGrid, u: TileUniforms): TileResu
 
         const win = insideness.greaterThan(best) as V;
         bestVal.assign(select(win, h2.y, bestVal));
+        bestCx.assign(select(win, cxf, bestCx));
+        bestCy.assign(select(win, cyf, bestCy));
         best.assign(select(win, insideness, best));
       }
     }
 
     // best is −SDF in UV: >0 inside, 0 at the edge, negative in the gap.
-    return vec2(smoothstep(0, u.edge.add(1e-5), best), bestVal);
+    return vec4(smoothstep(0, u.edge.add(1e-5), best), bestVal, bestCx, bestCy);
   })() as V;
-  return { mask: packed.x, value: packed.y };
+
+  const mask = packed.x as V;
+  const value = packed.y as V;
+  const cx = packed.z as V; // winning cell index (float)
+  const cy = packed.w as V;
+
+  // Per-cell outputs, derived from the winning cell OUTSIDE the loop (no iteration). Recompute the winner's
+  // centre exactly as the loop did (same seed-0 hash + offset) so cellCoord is the true tile-local position.
+  // Every hash goes through the WRAPPED index (periods C, R via hashCell2ToVec3Seed) → seamless tiling.
+  const cxi = int(cx);
+  const cyi = int(cy);
+  const off = select(mod(cy, float(F)).notEqual(0), u.rowOffset, float(0)) as V;
+  const h1 = hashCell2ToVec3Seed(cxi, cyi, 0, C, R) as V;
+  const centerX = cx.add(0.5).add(off).add(h1.x.sub(0.5).mul(u.posRandom)) as V;
+  const centerY = cy.add(0.5).add(h1.y.sub(0.5).mul(u.posRandom)) as V;
+  const cellCoord = vec3(g.x.sub(centerX), g.y.sub(centerY), 0) as V;
+  const cellRandom = hashCell2ToVec3Seed(cxi, cyi, 2, C, R) as V; // seed 2 is free (loop uses 0 and 1)
+
+  return { mask, value, cellCoord, cellRandom };
 }
 
 // Hexagon lattice — a regular hex grid (honeycomb). It's a Voronoi of the running-bond offset lattice: each
@@ -129,11 +164,13 @@ export function hexPattern(coord: V, columns: number, rows: number, gap: V, edge
     const g = vec2(coord.x.mul(C), coord.y.mul(R)) as V;
     const baseRow = floor(g.y) as V;
 
-    // Pass 1 — nearest hex centre (F1): its UV position + per-hex value.
+    // Pass 1 — nearest hex centre (F1): its UV position + per-hex value + winning cell index.
     const nearD = float(1e9).toVar();
     const nCx = float(0).toVar(); // nearest centre, UV
     const nCy = float(0).toVar();
     const nVal = float(0).toVar();
+    const nCix = float(0).toVar(); // winning hex cell index (float), for per-cell coord/random below
+    const nCiy = float(0).toVar();
     for (let dy = -1; dy <= 1; dy++) {
       const cyf = baseRow.add(dy) as V;
       const off = select(mod(cyf, float(2)).notEqual(0), float(0.5), float(0)) as V;
@@ -147,6 +184,8 @@ export function hexPattern(coord: V, columns: number, rows: number, gap: V, edge
         nearD.assign(select(win, d, nearD));
         nCx.assign(select(win, cux, nCx));
         nCy.assign(select(win, cuy, nCy));
+        nCix.assign(select(win, cxf, nCix));
+        nCiy.assign(select(win, cyf, nCiy));
         nVal.assign(select(win, hashCell2(int(cxf), int(cyf), C, R), nVal));
       }
     }
@@ -175,7 +214,22 @@ export function hexPattern(coord: V, columns: number, rows: number, gap: V, edge
       }
     }
 
-    return vec2(smoothstep(gap, gap.add(edge).add(1e-5), edgeD), nVal);
+    return vec4(smoothstep(gap, gap.add(edge).add(1e-5), edgeD), nVal, nCix, nCiy);
   })() as V;
-  return { mask: packed.x, value: packed.y };
+
+  const mask = packed.x as V;
+  const value = packed.y as V;
+  const cix = packed.z as V; // winning hex cell index (float)
+  const ciy = packed.w as V;
+
+  // Per-cell outputs from the winning hex, derived outside the passes. Recompute the winner's UV centre from
+  // its integer index (same running-bond offset the passes use) so cellCoord is tile-local; cellRandom uses
+  // the WRAPPED cell hash (periods C, R) → seamless across the tile edge.
+  const off = select(mod(ciy, float(2)).notEqual(0), float(0.5), float(0)) as V;
+  const cux = cix.add(0.5).add(off).div(C) as V;
+  const cuy = ciy.add(0.5).div(R) as V;
+  const cellCoord = vec3(coord.x.sub(cux).mul(C), coord.y.sub(cuy).mul(R), 0) as V;
+  const cellRandom = hashCell2ToVec3Seed(int(cix), int(ciy), 2, C, R) as V;
+
+  return { mask, value, cellCoord, cellRandom };
 }

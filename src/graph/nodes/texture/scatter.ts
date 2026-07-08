@@ -29,14 +29,14 @@ export const scatterNode: MaterialNodeDef = {
   ],
   build(ctx) {
     const coord = (ctx.inputs.coord ?? ctx.coord) as V;
-    const rawDensity = Math.round(Number(ctx.params.density ?? 10));
+    const rawDensity = Math.round(Number(ctx.constant("density") ?? 10));
     const density = Number.isFinite(rawDensity) ? Math.max(1, rawDensity) : 10;
     const { coord: local, value, size } = scatterPattern(coord, density, {
-      amount: ctx.uniforms.amount as V,
-      radius: ctx.uniforms.radius as V,
-      sizeRandom: ctx.uniforms.sizeRandom as V,
-      posRandom: ctx.uniforms.posRandom as V,
-      rotRandom: ctx.uniforms.rotRandom as V,
+      amount: ctx.live("amount") as V,
+      radius: ctx.live("radius") as V,
+      sizeRandom: ctx.live("sizeRandom") as V,
+      posRandom: ctx.live("posRandom") as V,
+      rotRandom: ctx.live("rotRandom") as V,
     });
     return { coord: local, value, size };
   },

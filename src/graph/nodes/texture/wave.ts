@@ -29,24 +29,27 @@ export const waveNode: MaterialNodeDef = {
     // blenderWave receives the raw (mapped) coord + scale uniform: the live path scales internally; the
     // offline path snaps the band frequency to integers (build-time scaleNum) for seamless tiling.
     const coord = ctx.inputs.coord ?? ctx.coord;
+    // scale/distortion/detailScale are read BOTH at build time (integer band frequency offline, distortion
+    // on/off branch) AND passed as live uniforms — "constant wins" in the contract, so an edit rebuilds
+    // (matches their former bakeStructural). phase/detailRoughness are pure live uniforms.
     const opts = {
-      waveType: Math.max(0, WAVE_TYPES.indexOf(ctx.params.waveType as string)),
-      dir: Math.max(0, DIRS.indexOf(ctx.params.direction as string)),
-      profile: Math.max(0, PROFILES.indexOf(ctx.params.profile as string)),
-      withDistortion: Number(ctx.params.distortion ?? 0) > 0,
-      detail: (ctx.params.detail as number) ?? 2,
+      waveType: Math.max(0, WAVE_TYPES.indexOf(ctx.constant("waveType") as string)),
+      dir: Math.max(0, DIRS.indexOf(ctx.constant("direction") as string)),
+      profile: Math.max(0, PROFILES.indexOf(ctx.constant("profile") as string)),
+      withDistortion: Number(ctx.constant("distortion") ?? 0) > 0,
+      detail: (ctx.constant("detail") as number) ?? 2,
       tileable: ctx.backend === "offline",
-      scaleNum: Number(ctx.params.scale ?? 1),
-      detailScaleNum: Number(ctx.params.detailScale ?? 1),
+      scaleNum: Number(ctx.constant("scale") ?? 1),
+      detailScaleNum: Number(ctx.constant("detailScale") ?? 1),
     };
     return {
       field: blenderWave(
         coord,
-        ctx.uniforms.scale,
-        ctx.uniforms.phase,
-        ctx.uniforms.distortion,
-        ctx.uniforms.detailScale,
-        ctx.uniforms.detailRoughness,
+        ctx.live("scale"),
+        ctx.live("phase"),
+        ctx.live("distortion"),
+        ctx.live("detailScale"),
+        ctx.live("detailRoughness"),
         opts,
       ),
     };
