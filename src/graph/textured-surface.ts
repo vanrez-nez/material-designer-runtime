@@ -54,9 +54,6 @@ export class TexturedSurface {
 
   readonly scaleUniform = uniform(1.2); // triplanar world scale (the "world / tile" control)
   readonly sharpnessUniform = uniform(8); // triplanar blend exponent
-  readonly roughnessFactor = uniform(1); // glTF-style factors multiplied into the baked channels (live)
-  readonly metalnessFactor = uniform(1);
-  readonly colorTint = uniform(new THREE.Color(1, 1, 1));
   readonly parallaxScale = uniform(0); // 0 = OFF (the march is opt-in; it's the effect's dominant cost)
   lastBakeMs = 0;
 
@@ -202,15 +199,6 @@ export class TexturedSurface {
   }
   setSharpness(value: number): void {
     this.sharpnessUniform.value = value;
-  }
-  setRoughnessFactor(value: number): void {
-    this.roughnessFactor.value = value;
-  }
-  setMetalnessFactor(value: number): void {
-    this.metalnessFactor.value = value;
-  }
-  setColorTint(hex: string): void {
-    this.colorTint.value.set(hex);
   }
   // Parallax depth. 0 must REMOVE the march (its dominant cost), so crossing 0 re-wires; above 0 it's live.
   setParallaxScale(value: number): void {
@@ -478,12 +466,12 @@ export class TexturedSurface {
       return;
     }
     // Common channels — every family lights these.
-    m.colorNode = present.has("baseColor") ? sample("baseColor").mul(this.colorTint) : null;
+    m.colorNode = present.has("baseColor") ? sample("baseColor") : null;
     m.normalNode = present.has("normal") ? shadingNormal : null;
-    // Roughness/metalness only exist on Standard-derived families; the glTF-style factors ride them.
+    // Roughness/metalness only exist on Standard-derived families.
     if (caps.roughMetal) {
-      m.roughnessNode = present.has("roughness") ? sample("roughness").r.mul(this.roughnessFactor) : null;
-      m.metalnessNode = present.has("metallic") ? sample("metallic").r.mul(this.metalnessFactor) : null;
+      m.roughnessNode = present.has("roughness") ? sample("roughness").r : null;
+      m.metalnessNode = present.has("metallic") ? sample("metallic").r : null;
     }
     if (caps.ao) {
       const vAo = attribute("vertexAo", "float");
