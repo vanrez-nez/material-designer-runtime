@@ -73,7 +73,8 @@ function ssTargetsFor(w: number, h: number): SsTargets {
   const key = `${w}x${h}`;
   const existing = ssPool.get(key);
   if (existing) return existing;
-  const ssRT = new RenderTarget(w, h);
+  // Color-only supersample intermediate — no depth test — so skip the (default) depth/stencil attachment.
+  const ssRT = new RenderTarget(w, h, { depthBuffer: false, stencilBuffer: false });
   ssRT.texture.colorSpace = NoColorSpace;
   ssRT.texture.minFilter = ssRT.texture.magFilter = NearestFilter;
   ssRT.texture.wrapS = ssRT.texture.wrapT = RepeatWrapping; // box taps at tile edges wrap, not clamp

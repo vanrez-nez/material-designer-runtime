@@ -180,6 +180,14 @@ export class TexturedSurface {
     return this.rebuild();
   }
 
+  // Release intermediate bake caches (per-node cache targets + bake materials), keeping the channel
+  // textures the surface samples. For bake-once consumers that never re-bake — the editor never calls
+  // this. A later edit self-heals: the emptied uniforms/paramUsage force one full rebuild that repopulates.
+  async releaseCaches(): Promise<void> {
+    await this.whenIdle(); // never flush while a bake/re-render is in flight
+    this.set.flushCaches();
+  }
+
   // Regenerate from scratch: flush ALL baked GPU state (every channel + decomposition-cache target and its
   // material) and re-bake with a full recompile. Routed through the single-flight pump so it can't race a bake
   // that's already running. Use when caches may be stale/corrupt; heavier than a normal re-bake.

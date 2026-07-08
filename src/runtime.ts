@@ -42,6 +42,12 @@ export class MaterialGraphRuntime {
     return buildMeshMaterial(this.graph.document, { get: (ch) => this.surface.getChannelTexture(ch) });
   }
 
+  // Free intermediate bake caches after a final refresh(); keeps the sampled channel maps. Bake-once
+  // consumers call this once at load to reclaim the re-bake cache GPU memory they'll never use.
+  releaseCaches(): Promise<void> {
+    return this.surface.releaseCaches();
+  }
+
   get lastError(): string | null {
     return this.surface.lastError ?? this.graph.lastError;
   }

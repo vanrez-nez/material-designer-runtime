@@ -73,7 +73,8 @@ export const SURFACE_CHANNELS: PbrSocket[] = [
 // colour channels sRGB (sampler linearises for PBR), data channels linear; repeat-wrap + trilinear/aniso
 // mips so the high-frequency maps don't shimmer at grazing angles.
 function makeChannelTarget(ch: PbrSocket | "height", size: number): RenderTarget {
-  const rt = new RenderTarget(size, size);
+  // Color-only bake pass — no depth test — so skip the (default) depth/stencil attachment.
+  const rt = new RenderTarget(size, size, { depthBuffer: false, stencilBuffer: false });
   const t = rt.texture;
   t.colorSpace =
     ch !== "height" && COLOR_CHANNELS.includes(ch as PbrSocket) ? THREE.SRGBColorSpace : THREE.NoColorSpace;
@@ -91,7 +92,11 @@ function makeChannelTarget(ch: PbrSocket | "height", size: number): RenderTarget
 // trilinear mipmaps so a lower-resolution consumer reads an area-averaged level — a faithful downsample of the
 // reference-resolution cache instead of an aliased bilinear tap.
 function makeCacheTarget(size: number, mips = false): RenderTarget {
-  const rt = new RenderTarget(size, size, { type: THREE.HalfFloatType });
+  const rt = new RenderTarget(size, size, {
+    type: THREE.HalfFloatType,
+    depthBuffer: false, // color-only cache pass — no depth test
+    stencilBuffer: false,
+  });
   const t = rt.texture;
   t.colorSpace = THREE.NoColorSpace;
   t.wrapS = t.wrapT = THREE.RepeatWrapping;
@@ -704,7 +709,7 @@ export class MaterialBakeService {
   private scratchTarget(size: number): RenderTarget {
     if (!this.scratch || this.scratchSize !== size) {
       this.scratch?.dispose();
-      this.scratch = new RenderTarget(size, size);
+      this.scratch = new RenderTarget(size, size, { depthBuffer: false, stencilBuffer: false });
       this.scratchSize = size;
     }
     return this.scratch;
