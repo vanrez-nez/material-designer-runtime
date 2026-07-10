@@ -7,10 +7,17 @@ type V = MaterialValue; // loose TSL value (= any); the three/tsl overloads are 
 // grit) is genuinely huge — dh/du in the hundreds — so an unclamped `vec3(-dh/du, -dh/dv, 1)` normalizes
 // to a vector lying almost IN the tangent plane (z ≈ 0). That perturbed normal is ~perpendicular to the
 // geometry normal, which collapses N·L to ~0 and turns the whole surface black under direct light. Bounding
-// the slope magnitude caps the tilt at atan(MAX) so z stays ≥ 1/√(1+MAX²): the normal can never go
-// degenerate and lighting can never collapse, regardless of strength or height frequency. MAX = 1 → ≤45°
-// tilt, z ≥ 0.707. Strength still controls the look below the clamp; above it the bump saturates.
-const MAX_SLOPE = 1.0;
+// the slope keeps z ≥ 1/√(1+MAX²) so the normal can never go degenerate, regardless of strength or height
+// frequency. MAX = 8 → tilt ≤ ~83°, z ≥ 0.124. This ceiling assumes the height carries per-texel detail
+// (erosion, interior noise) so slopes VARY — a perfectly smooth steep feature would still saturate to a
+// near-constant tilt and read faceted; rough the height, don't lower this back.
+//
+// The bound must be a SOFT compression, never a hard clamp: a hard clamp maps every slope above MAX to
+// exactly MAX, so any steep smooth feature (a pebble dome, a dune) bakes a constant-tilt normal whose only
+// variation is direction — which is the shading of a CONE. Every scattered rock rendered as a "pinched"
+// cone with radial facet creases until this was made smooth (s·MAX/√(MAX²+s²): identity for small slopes,
+// asymptote MAX, monotonic — curvature survives compression).
+const MAX_SLOPE = 8.0;
 
 // Derives a surface normal from a scalar height field — backend-aware:
 //   live    → bumpMap (screen-space derivative bump over positionWorld; a perturbed world normal).
@@ -40,12 +47,12 @@ export const normalFromHeightNode: MaterialNodeDef = {
     const dhdu = dFdx(hv).div(dFdx(u.x)) as V;
     const dhdv = dFdy(hv).div(dFdy(u.y)) as V;
     const s = ctx.live("strength") as V;
-    // Clamp the slope magnitude to MAX_SLOPE (scale down only when it exceeds it) so the normal can't
-    // collapse into the tangent plane on steep/high-frequency heights — see MAX_SLOPE.
+    // Compress the slope toward MAX_SLOPE smoothly (s·MAX/√(MAX²+s²)) so the normal can't collapse into
+    // the tangent plane, while steep smooth features keep their curvature — see MAX_SLOPE.
     const slope = vec2(dhdu, dhdv).mul(s) as V;
     const maxLen = float(MAX_SLOPE);
-    const clamped = slope.mul(maxLen.div(slope.length().max(maxLen))) as V;
-    const n = normalize(vec3(clamped.x.negate(), clamped.y.negate(), float(1))) as V;
+    const soft = slope.mul(maxLen.div(slope.length().pow(2).add(maxLen.mul(maxLen)).sqrt())) as V;
+    const n = normalize(vec3(soft.x.negate(), soft.y.negate(), float(1))) as V;
     return { normal: n.mul(0.5).add(0.5) }; // encode [-1,1] → [0,1] for the normal-map texture
   },
 };

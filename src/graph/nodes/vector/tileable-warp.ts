@@ -16,24 +16,28 @@ export const tileableWarpNode: MaterialNodeDef = {
   outputs: [{ key: "coord", kind: "vector" }],
   params: [
     { key: "amount", label: "amount", type: "float", min: 0, max: 1, step: 0.01, default: 0.15 },
-    { key: "scale", label: "scale", type: "int", min: 1, max: 64, step: 1, default: 4 },
+    // Step-1 float, NOT int: int params rebuild the surface structurally (a full ~seconds pipeline
+    // recompile per tick — see controller.setParam), while a float rides the live-uniform path. The
+    // period only needs to be an integer VALUE for seamlessness, and pnoise2 takes it as GPU math
+    // (mod by `rep`), so we round the uniform in-shader instead of folding a constant into the WGSL.
+    { key: "scale", label: "scale", type: "float", min: 1, max: 64, step: 1, default: 4 },
   ],
   build(ctx) {
     const base = (ctx.inputs.coord ?? ctx.coord) as V;
     const amount = ctx.live("amount") as V;
+    const P = (ctx.live("scale") as V).round().clamp(1, 64) as V; // integer period as a uniform — no recompile on edit
 
     if (ctx.backend === "live") {
-      const p = base.div(Math.max(1, Number(ctx.constant("scale") ?? 4))) as V;
+      const p = base.div(P) as V;
       const wx = mx_noise_float(p.add(vec3(11.3, 0, 0)));
       const wy = mx_noise_float(p.add(vec3(0, 47.7, 0)));
       const wz = mx_noise_float(p.add(vec3(0, 0, 93.1)));
       return { coord: base.add(vec3(wx, wy, wz).mul(amount)) };
     }
-    // offline: periodic warp over the uv tile. Period = scale (integer); decorrelate the two channels with
-    // constant offsets (phase shifts that preserve periodicity).
-    const P = Math.max(1, Math.round(Number(ctx.constant("scale") ?? 4)));
+    // offline: periodic warp over the uv tile. Period = scale (integer value); decorrelate the two channels
+    // with constant offsets (phase shifts that preserve periodicity).
     const uv = vec2(base.x, base.y) as V;
-    const rep = vec2(P, P);
+    const rep = vec2(P, P) as V;
     const wx = pnoise2(uv.mul(P), rep);
     const wy = pnoise2(uv.mul(P).add(vec2(5.2, 1.3)), rep);
     const warped = uv.add(vec2(wx, wy).mul(amount)) as V;

@@ -27,6 +27,9 @@ export const shapeNode: MaterialNodeDef = {
     { key: "irregularity", label: "irregularity", type: "float", min: 0, max: 1, step: 0.01, default: 0.6 },
     { key: "dome", label: "dome", type: "float", min: 0.2, max: 3, step: 0.05, default: 0.6 },
     { key: "edge", label: "edge soft", type: "float", min: 0.002, max: 0.3, step: 0.002, default: 0.04 },
+    { key: "tilt", label: "tilt", type: "float", min: 0, max: 1, step: 0.01, default: 0 },
+    { key: "formRandom", label: "form rand", type: "float", min: 0, max: 1, step: 0.01, default: 0 },
+    { key: "erode", label: "erode", type: "float", min: 0, max: 1, step: 0.01, default: 0 },
   ],
   build(ctx) {
     const coord = (ctx.inputs.coord ?? ctx.coord) as V;
@@ -38,6 +41,9 @@ export const shapeNode: MaterialNodeDef = {
       irregularity: ctx.live("irregularity") as V,
       dome: ctx.live("dome") as V,
       edge: ctx.live("edge") as V,
+      tilt: ctx.live("tilt") as V,
+      formRandom: ctx.live("formRandom") as V,
+      erode: ctx.live("erode") as V,
     });
     return { mask, height };
   },
