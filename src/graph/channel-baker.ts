@@ -32,9 +32,10 @@ const SS = 2;
 // material (makeChannelMaterial), so re-rendering after only a uniform changed reuses the compiled pipeline
 // — no WGSL/pipeline recompile. (Reassigning a material's colorNode + needsUpdate is what forces a recompile.)
 const bakeQuad = new QuadMesh(new MeshBasicNodeMaterial());
-// Scratch material for one-off raw-colorNode renders (PNG export / 2D preview via renderColorNodeToTarget).
-// That path recompiles per call, which is fine for non-interactive one-offs.
-const scratchMat = new MeshBasicNodeMaterial();
+// One-off raw-colorNode renders (PNG export / 2D preview) use a FRESH material per call, disposed right
+// after (see renderColorNodeToTarget): the path recompiles per call anyway, and a persistent scratch
+// material would retain its LAST colorNode — pinning that whole compiled graph (TSL tree + pipeline via
+// the renderer's strong caches) until the next one-off, invisibly to any flush/regenerate.
 
 // Box filter: average the SS×SS high-res texels covering each destination texel. The normal channel must
 // average decoded vectors (raw encoded [0,1] normals don't average linearly), then renormalize + re-encode.
@@ -68,6 +69,12 @@ interface SsTargets {
 // (16MB at 2048²), and under rapid editing Dawn's deferred frees pile up into gigabytes (tab OOM). Sizes in
 // use are few (surface + preview + export), so the pool is small and bounded, not per-edit growth.
 const ssPool = new Map<string, SsTargets>();
+
+// Debug/verification: what the persistent supersample pool currently holds (sizes are keys, so growth
+// beyond the handful of sizes in use — surface, preview, export — is the leak signal).
+export function ssPoolInfo(): string[] {
+  return [...ssPool.keys()];
+}
 
 function ssTargetsFor(w: number, h: number): SsTargets {
   const key = `${w}x${h}`;
@@ -175,7 +182,11 @@ export function renderColorNodeToTarget(
   rt: RenderTarget,
   isNormal = false,
 ): void {
-  scratchMat.colorNode = colorNode;
-  scratchMat.needsUpdate = true;
-  renderMaterialToTarget(renderer, scratchMat, rt, isNormal);
+  const mat = new MeshBasicNodeMaterial();
+  mat.colorNode = colorNode;
+  mat.needsUpdate = true;
+  renderMaterialToTarget(renderer, mat, rt, isNormal);
+  // Submitted command buffers keep their GPU objects alive (Dawn refcounts); disposing here only drops the
+  // renderer's cache entries so nothing pins the compiled graph after the render.
+  mat.dispose();
 }

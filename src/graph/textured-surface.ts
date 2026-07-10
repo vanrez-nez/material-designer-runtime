@@ -193,6 +193,12 @@ export class TexturedSurface {
     this.requestUpdate("rebuild");
   }
 
+  // Debug/verification: this surface's baked-set container counts (see BakedTextureSet.debugCounts) plus
+  // lifecycle state — the per-material half of the Regenerate release audit.
+  debugReport(): Record<string, unknown> {
+    return { busy: this.busy, backend: this.backend, set: this.set.debugCounts() };
+  }
+
   // --- live surface tuning (offline backend) -----------------------------------------------------
   setScale(value: number): void {
     this.scaleUniform.value = value;

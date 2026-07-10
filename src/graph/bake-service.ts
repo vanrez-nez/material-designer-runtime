@@ -8,6 +8,7 @@ import {
   renderCacheToTarget,
   compileMaterialsAsync,
   makeChannelMaterial,
+  ssPoolInfo,
   COLOR_CHANNELS,
 } from "./channel-baker";
 import { countGraphNodes, type CacheEntry, type CacheSizing, type ParamUsage } from "./compiler";
@@ -338,6 +339,19 @@ export class BakedTextureSet {
     }
     this.constArrays.set(id, { node, length: data.length, elementType });
     return node;
+  }
+
+  // Debug/verification: live GPU-holding container sizes for this set. Flat numbers across repeated
+  // Regenerate cycles = caches really are released; growth = an id-keyed map is pinning targets.
+  debugCounts(): Record<string, number> {
+    return {
+      channelTargets: this.targets.size,
+      channelMats: this.mats.size,
+      cacheTargets: this.cacheTargets.size,
+      cacheMats: this.cacheMats.size,
+      constArrays: this.constArrays.size,
+      heightTarget: this.heightTarget ? 1 : 0,
+    };
   }
 
   flushCaches(): void {
@@ -711,6 +725,20 @@ export class MaterialBakeService {
       }
       return new ImageData(data, size, size);
     });
+  }
+
+  // Debug/verification: renderer-side resource counts + this service's persistent pools. `rendererTextures`
+  // is three's own live-texture count (renderer.info.memory) — the number that must return to baseline
+  // after a Regenerate; the pool fields are persistent by design and must stay small and bounded.
+  gpuInfo(): Record<string, unknown> {
+    const info = (this.renderer as unknown as { info?: { memory?: Record<string, number> } } | null)?.info;
+    return {
+      rendererTextures: info?.memory?.textures ?? -1,
+      rendererGeometries: info?.memory?.geometries ?? -1,
+      scratchTarget: this.scratch ? `${this.scratchSize}px` : "none",
+      scratchCaches: this.scratchCaches.size,
+      ssPool: ssPoolInfo(),
+    };
   }
 
   private scratchTarget(size: number): RenderTarget {
