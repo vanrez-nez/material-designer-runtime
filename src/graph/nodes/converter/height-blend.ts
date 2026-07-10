@@ -1,4 +1,4 @@
-import { float, smoothstep } from "three/tsl";
+import { float, smoothstep, fwidth, max } from "three/tsl";
 import type { MaterialNodeDef, MaterialValue } from "../../types";
 
 // Height Blend — produces a feature-aware mask (`fac`) for the Mix Shader, so a transition between two
@@ -23,7 +23,9 @@ export const heightBlendNode: MaterialNodeDef = {
   outputs: [{ key: "fac", kind: "float" }],
   params: [
     { key: "transition", label: "transition", type: "float", min: 0, max: 1, step: 0.01, default: 0.5 },
-    { key: "width", label: "width", type: "float", min: 0.01, max: 1, step: 0.01, default: 0.25 },
+    // min 0 is safe: build() floors the smoothstep band at fwidth(d) (one texel/pixel), so width=0 yields a
+    // crisp, analytically anti-aliased edge rather than the degenerate smoothstep(0,0) divide-by-zero.
+    { key: "width", label: "width", type: "float", min: 0, max: 1, step: 0.01, default: 0.25 },
     { key: "breakup", label: "breakup amt", type: "float", min: 0, max: 1, step: 0.01, default: 0 },
   ],
   build(ctx) {
@@ -36,6 +38,11 @@ export const heightBlendNode: MaterialNodeDef = {
       hB = hB.add((ctx.inputs.breakup as V).sub(0.5).mul(ctx.live("breakup"))) as V;
     }
     const d = hB.sub(hA).add(t.mul(2).sub(1)) as V; // relative height, biased by transition
-    return { fac: smoothstep(w.negate(), w, d) };
+    // Analytic anti-alias: never let the edge band be narrower than one screen-pixel / bake-texel step
+    // (fwidth(d) = |d change| per fragment). `width` stays the artistic soft-blend control; the derivative
+    // term only takes over when width is sub-texel, so a "hard" mask (width→0) anti-aliases into a crisp
+    // 1-texel edge instead of staircasing, while a genuine soft transition (large width) is unaffected.
+    const e = max(w, fwidth(d)) as V;
+    return { fac: smoothstep(e.negate(), e, d) };
   },
 };
