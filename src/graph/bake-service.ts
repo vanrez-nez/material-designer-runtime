@@ -11,6 +11,14 @@ import {
   COLOR_CHANNELS,
 } from "./channel-baker";
 import { countGraphNodes, type CacheEntry, type CacheSizing, type ParamUsage } from "./compiler";
+import {
+  profilableNodes,
+  deriveMarginals,
+  median,
+  type NodeProfileOptions,
+  type NodeProfileReport,
+  type NodeProfileRow,
+} from "./node-profiler";
 import type { MaterialGraphSource, MaterialValue, PbrSocket } from "./types";
 import { uniformArray } from "three/tsl";
 
@@ -562,7 +570,7 @@ export class MaterialBakeService {
       // Wait for the GPU to actually finish before resolving — gives the caller real back-pressure so it
       // can't submit the next bake while this one is still executing (the cause of the editing GPU backlog).
       const tGpu0 = performance.now();
-      await this.gpuSync(set);
+      await this.gpuSync(set.firstTarget());
       const gpuWaitMs = performance.now() - tGpu0;
       // Real generation time the widget reports = compile + shader-compile + render + GPU completion.
       const totalMs = compileMs + precompileMs + dispatchMs + gpuWaitMs;
@@ -582,8 +590,8 @@ export class MaterialBakeService {
 
   // Resolve only once the GPU has finished the preceding renders — turning "submitted" into "completed" so
   // the caller has real back-pressure. Prefer the WebGPU queue's transfer-free `onSubmittedWorkDone`; fall
-  // back to a 1px readback (also forces a GPU sync) when the backend doesn't expose it.
-  private async gpuSync(set: BakedTextureSet): Promise<void> {
+  // back to a 1px readback of `fallback` (also forces a GPU sync) when the backend doesn't expose it.
+  private async gpuSync(fallback: RenderTarget | null): Promise<void> {
     const renderer = this.renderer;
     if (!renderer) return;
     const queue = (renderer as unknown as { backend?: { device?: { queue?: GPUQueueLike } } }).backend
@@ -592,8 +600,7 @@ export class MaterialBakeService {
       await queue.onSubmittedWorkDone();
       return;
     }
-    const rt = set.firstTarget();
-    if (rt) await renderer.readRenderTargetPixelsAsync(rt, 0, 0, 1, 1);
+    if (fallback) await renderer.readRenderTargetPixelsAsync(fallback, 0, 0, 1, 1);
   }
 
   // Re-render the LAST-compiled per-channel materials into `set`'s targets WITHOUT recompiling. The caller
@@ -636,7 +643,7 @@ export class MaterialBakeService {
       const dispatchMs = performance.now() - tDispatch0;
       // Baseline path (no recompile): same channels re-rendered, reusing existing pipelines.
       const tGpu0 = performance.now();
-      await this.gpuSync(set); // back-pressure: resolve only after the GPU finishes (see bakeInto)
+      await this.gpuSync(set.firstTarget()); // back-pressure: resolve only after the GPU finishes (see bakeInto)
       const gpuWaitMs = performance.now() - tGpu0;
       this.emitReport({ ...report, phase: "done", totalMs: dispatchMs + gpuWaitMs });
       if (BAKE_PROFILE) {
@@ -713,6 +720,76 @@ export class MaterialBakeService {
       this.scratchSize = size;
     }
     return this.scratch;
+  }
+
+  // Per-node cost profiling (dev tool — see node-profiler.ts for what "per node" honestly means). Each
+  // profilable node's subtree is solo-compiled and rendered in isolation into the pooled scratch target:
+  // one cold render (TSL build + pipeline compile + first draw → pipelineMs), then `runs` warm re-renders,
+  // each awaited with real GPU back-pressure, medianed → renderMs. A constant-color render measured first
+  // gives the floor (`overheadMs`) that every renderMs includes. Serialised on the bake queue — the
+  // channel-baker's quads are shared, and a profile must not interleave with a live bake.
+  profileNodes(graph: MaterialGraphSource, opts: NodeProfileOptions = {}): Promise<NodeProfileReport> {
+    const size = Math.max(64, Math.min(2048, opts.size ?? 512));
+    const runs = Math.max(1, Math.min(32, opts.runs ?? 6));
+    return this.enqueue("profile", async () => {
+      const renderer = this.renderer;
+      const report: NodeProfileReport = { size, runs, overheadMs: 0, nodes: [] };
+      if (!renderer) return report;
+      const rt = this.scratchTarget(size);
+      const doc = graph.document;
+
+      // One cold+warm measurement of an already-assigned material; the caller owns colorNode/needsUpdate.
+      const measure = async (mat: MeshBasicNodeMaterial): Promise<{ pipelineMs: number; renderMs: number }> => {
+        const t0 = performance.now();
+        renderCacheToTarget(renderer, mat, rt);
+        await this.gpuSync(rt);
+        const pipelineMs = performance.now() - t0;
+        const samples: number[] = [];
+        for (let i = 0; i < runs; i++) {
+          const t = performance.now();
+          renderCacheToTarget(renderer, mat, rt);
+          await this.gpuSync(rt);
+          samples.push(performance.now() - t);
+        }
+        return { pipelineMs, renderMs: median(samples) };
+      };
+
+      const floorMat = makeChannelMaterial();
+      floorMat.colorNode = vec3(0.5, 0.5, 0.5);
+      floorMat.needsUpdate = true;
+      report.overheadMs = (await measure(floorMat)).renderMs;
+      floorMat.dispose();
+
+      for (const node of profilableNodes(doc, graph.getRegistry(), opts.nodeIds)) {
+        const row: NodeProfileRow = {
+          nodeId: node.id, type: node.type, label: node.label, pipelineMs: 0, renderMs: 0, marginalMs: 0,
+        };
+        report.nodes.push(row);
+        let colorNode: MaterialValue | undefined;
+        try {
+          const { bundle } = graph.compileBundle({ backend: "offline", soloNodeId: node.id });
+          colorNode = (bundle as Partial<Record<string, MaterialValue>>).baseColor;
+        } catch (err) {
+          row.error = err instanceof Error ? err.message : String(err);
+          continue;
+        }
+        if (!colorNode) {
+          row.error = "no solo output";
+          continue;
+        }
+        const mat = makeChannelMaterial();
+        mat.colorNode = colorNode;
+        mat.needsUpdate = true;
+        const m = await measure(mat);
+        mat.dispose(); // frees this subtree's one-off pipeline instead of pinning it in the renderer cache
+        row.pipelineMs = m.pipelineMs;
+        row.renderMs = m.renderMs;
+      }
+
+      deriveMarginals(report.nodes, doc, report.overheadMs);
+      report.nodes.sort((a, b) => b.renderMs - a.renderMs);
+      return report;
+    });
   }
 
   // A transient decomposition cache (16F target + bake material) for readImage, keyed by cacheId. The whole

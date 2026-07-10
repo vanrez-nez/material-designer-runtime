@@ -17,6 +17,11 @@ export {
   type BakeReport,
 } from "./graph/bake-service";
 export {
+  type NodeProfileOptions,
+  type NodeProfileReport,
+  type NodeProfileRow,
+} from "./graph/node-profiler";
+export {
   compileGraph,
   compileSockets,
   countGraphNodes,

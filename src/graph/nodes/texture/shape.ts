@@ -30,6 +30,9 @@ export const shapeNode: MaterialNodeDef = {
     { key: "tilt", label: "tilt", type: "float", min: 0, max: 1, step: 0.01, default: 0 },
     { key: "formRandom", label: "form rand", type: "float", min: 0, max: 1, step: 0.01, default: 0 },
     { key: "erode", label: "erode", type: "float", min: 0, max: 1, step: 0.01, default: 0 },
+    // Structural opt-in: each tap re-evaluates the whole silhouette, multiplying shader size and pipeline
+    // compile time — so tap count is an explicit select, while `erode` strength stays a draggable uniform.
+    { key: "erodeTaps", label: "erode taps", type: "select", options: ["off", "4"], default: "off" },
   ],
   build(ctx) {
     const coord = (ctx.inputs.coord ?? ctx.coord) as V;
@@ -37,7 +40,9 @@ export const shapeNode: MaterialNodeDef = {
     const shape = (ctx.constant("shape") as string) ?? "blob";
     const rawSides = Math.round(Number(ctx.constant("sides") ?? 6));
     const sides = Number.isFinite(rawSides) ? Math.max(3, rawSides) : 6;
-    const { mask, height } = shapeField(coord, shape, sides, seed ?? null, {
+    // Tolerant parse: the UI stores the select as the string "4", but MCP/scripted edits may send a number.
+    const erodeTaps = parseInt(String(ctx.constant("erodeTaps") ?? "off"), 10) || 0;
+    const { mask, height } = shapeField(coord, shape, sides, erodeTaps, seed ?? null, {
       irregularity: ctx.live("irregularity") as V,
       dome: ctx.live("dome") as V,
       edge: ctx.live("edge") as V,

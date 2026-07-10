@@ -16,7 +16,6 @@ import type { MaterialValue } from "../graph/types";
 // the dome asymmetrically (tap ring rotated per instance by seed). erode = 0 leaves the shape bit-identical.
 type V = MaterialValue;
 const TAU = 6.283185307179586;
-const ERODE_TAPS = 4; // ring taps re-evaluating the body (unrolled; ~5× the silhouette math when eroding)
 const ERODE_RADII = [0.13, 0.21, 0.09, 0.17]; // per-tap radius factors — asymmetric chips, not a uniform shrink
 
 export interface ShapeUniforms {
@@ -33,10 +32,14 @@ export interface ShapeResult {
   height: V;
 }
 
+// `erodeTaps` is a BUILD-TIME constant (0 = erosion compiled out entirely): each tap re-evaluates the full
+// silhouette+body, so an always-on ring would multiply every consumer shader's size and pipeline-compile
+// time by ~(taps+1) — measured at ~5× whole-bake cost. Erosion is therefore an explicit structural opt-in.
 export function shapeField(
   coord: V,
   type: string,
   sides: number,
+  erodeTaps: number,
   seedIn: V | null,
   u: ShapeUniforms,
 ): ShapeResult {
@@ -100,11 +103,12 @@ export function shapeField(
     const centre = sample(coord.x, coord.y);
     let mask = centre.mask;
     let height = centre.height;
-    // Min-tap erosion: ring rotated per instance; per-tap radii differ so chips are asymmetric. With
-    // erode = 0 every tap lands on the centre sample and the min is a no-op.
-    const ringRot = fract(seed.mul(33.19)).mul(TAU) as V;
-    for (let i = 0; i < ERODE_TAPS; i++) {
-      const a = ringRot.add((i / ERODE_TAPS) * TAU) as V;
+    // Min-tap erosion: ring rotated per instance; per-tap radii differ so chips are asymmetric. Compiled
+    // only when erodeTaps > 0 (see the shapeField header); `erode` strength then stays a live uniform.
+    const taps = Math.max(0, Math.min(ERODE_RADII.length, Math.round(erodeTaps)));
+    const ringRot = taps > 0 ? (fract(seed.mul(33.19)).mul(TAU) as V) : null;
+    for (let i = 0; i < taps; i++) {
+      const a = (ringRot as V).add((i / taps) * TAU) as V;
       const rad = u.erode.mul(ERODE_RADII[i]) as V;
       const s = sample(coord.x.add(cos(a).mul(rad)), coord.y.add(sin(a).mul(rad)));
       mask = mask.min(s.mask) as V;
