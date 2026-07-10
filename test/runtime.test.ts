@@ -158,16 +158,12 @@ describe("material type transport", () => {
   });
 
   it("omits roughness/metalness channels for non-PBR families", () => {
-    const lambert = compileGraph(materialDoc("lambert"), defaultRegistry, { backend: "live" }).material as Record<
-      string,
-      unknown
-    >;
+    const lambert = compileGraph(materialDoc("lambert"), defaultRegistry, { backend: "live" })
+      .material as unknown as Record<string, unknown>;
     expect(lambert.roughnessNode == null).toBe(true);
     expect(lambert.metalnessNode == null).toBe(true);
-    const physical = compileGraph(materialDoc("physical"), defaultRegistry, { backend: "live" }).material as Record<
-      string,
-      unknown
-    >;
+    const physical = compileGraph(materialDoc("physical"), defaultRegistry, { backend: "live" })
+      .material as unknown as Record<string, unknown>;
     expect(physical.roughnessNode != null).toBe(true); // PBR family keeps the metal workflow
   });
 
