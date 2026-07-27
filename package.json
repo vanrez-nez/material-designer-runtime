@@ -1,6 +1,6 @@
 {
   "name": "material-designer-runtime",
-  "version": "0.1.4",
+  "version": "0.1.5",
   "description": "Lightweight runtime for loading and rendering Material Designer node graph documents.",
   "type": "module",
   "license": "MIT",
