@@ -15,9 +15,12 @@ export {
   type WorkerCacheStoreOptions,
 } from "./worker-client";
 export {
+  canDeflate,
   canEncodePng,
   decodeTexels,
+  deflateBytes,
   encodeTexels,
+  inflateBytes,
   pngRoundTripIsLossless,
 } from "./codec";
 export {

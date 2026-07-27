@@ -68,8 +68,35 @@ export async function decodePng(bytes: Uint8Array, size: number): Promise<Uint8A
   }
 }
 
-// Encode tightly-packed RGBA8 for storage. Falls back to raw when PNG isn't available, and reports which
-// encoding was actually used so the record is self-describing rather than relying on a global setting.
+// --- byte compression -------------------------------------------------------------------------------
+// The middle ground between raw and PNG: shrink the texels with the browser's built-in byte compressor
+// instead of an image codec. Lossless, no canvas, no ImageBitmap, no colour management to get wrong — so
+// unpacking is ordinary decompression rather than image decoding, which is what makes PNG restores slow.
+//
+// "deflate-raw" rather than gzip: same algorithm, without the header/checksum we have no use for.
+export function canDeflate(): boolean {
+  return typeof CompressionStream !== "undefined" && typeof DecompressionStream !== "undefined";
+}
+
+async function pipeThrough(
+  bytes: Uint8Array,
+  transform: CompressionStream | DecompressionStream,
+): Promise<Uint8Array> {
+  const stream = new Blob([bytes as BlobPart]).stream().pipeThrough(transform as ReadableWritablePair);
+  return new Uint8Array(await new Response(stream).arrayBuffer());
+}
+
+export function deflateBytes(bytes: Uint8Array): Promise<Uint8Array> {
+  return pipeThrough(bytes, new CompressionStream("deflate-raw"));
+}
+
+export function inflateBytes(bytes: Uint8Array): Promise<Uint8Array> {
+  return pipeThrough(bytes, new DecompressionStream("deflate-raw"));
+}
+
+// Encode tightly-packed RGBA8 for storage. Falls back to raw whenever the requested codec isn't available,
+// and reports which encoding was ACTUALLY used — each record is self-describing, so a store written by one
+// engine (or an older build) still reads correctly on another.
 export async function encodeTexels(
   texels: Uint8Array,
   size: number,
@@ -77,6 +104,9 @@ export async function encodeTexels(
 ): Promise<{ bytes: Uint8Array; encoding: BakeCacheEncoding }> {
   if (encoding === "png" && canEncodePng()) {
     return { bytes: await encodePng(texels, size), encoding: "png" };
+  }
+  if (encoding === "deflate" && canDeflate()) {
+    return { bytes: await deflateBytes(texels), encoding: "deflate" };
   }
   return { bytes: texels, encoding: "rgba8" };
 }
@@ -88,7 +118,9 @@ export async function decodeTexels(
   size: number,
   encoding: BakeCacheEncoding,
 ): Promise<Uint8Array> {
-  const out = encoding === "png" ? await decodePng(bytes, size) : bytes;
+  let out = bytes;
+  if (encoding === "png") out = await decodePng(bytes, size);
+  else if (encoding === "deflate") out = await inflateBytes(bytes);
   const expected = size * size * 4;
   if (out.length !== expected) {
     throw new Error(`decoded ${out.length} bytes, expected ${expected} for ${size}x${size}`);

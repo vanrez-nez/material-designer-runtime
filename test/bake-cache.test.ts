@@ -442,6 +442,19 @@ describe("bake cache policy", () => {
     expect(await store.get("k1")).toBeNull(); // the loser is evicted, not re-checked every bake
   });
 
+  // The two size knobs are in DIFFERENT currencies: maxEntryBytes gates the raw capture (it runs before the
+  // readback, when the stored size is unknowable), while budgetBytes governs compressed bytes on disk. A
+  // default sized against the disk figure silently stopped caching anything above 1024²x7, so pin the raw
+  // totals it must admit.
+  it("admits realistic full-material captures at the default raw ceiling", () => {
+    const cache = new BakeTextureCache({ store: createMemoryCacheStore(), enabled: true, minBakeMs: 0 });
+    const raw = (size: number, channels: number) => size * size * 4 * channels;
+    expect(cache.canWrite(1000, raw(1024, 7))).toBe(true); //  28 MB
+    expect(cache.canWrite(1000, raw(2048, 7))).toBe(true); // 112 MB — the case the old default rejected
+    expect(cache.canWrite(1000, raw(4096, 4))).toBe(true); // 256 MB
+    expect(cache.canWrite(1000, raw(4096, 7))).toBe(false); // 448 MB — too big a readback to be worth it
+  });
+
   it("refuses oversized entries and cheap bakes", async () => {
     const cache = new BakeTextureCache({
       store: createMemoryCacheStore(),
@@ -565,10 +578,12 @@ describe("bake cache policy", () => {
   it("reconfigures at runtime", async () => {
     const cache = new BakeTextureCache({ store: createMemoryCacheStore() });
     expect(cache.enabled).toBe(false); // opt-in: nothing happens until you say so
-    expect(cache.encoding).toBe("png"); // the worker codec makes PNG affordable, so it is the default
+    // Byte-compressed by default: restores as fast as raw, ~6x smaller on disk, and unlike PNG it costs
+    // nothing at restore time because there is no image to decode.
+    expect(cache.encoding).toBe("deflate");
     expect(cache.storeName).toBe("memory"); // a consumer-supplied store is never swapped out
-    cache.configure({ encoding: "rgba8", budgetBytes: 1, enabled: true, namespace: "ns" });
-    expect(cache.encoding).toBe("rgba8");
+    cache.configure({ encoding: "png", budgetBytes: 1, enabled: true, namespace: "ns" });
+    expect(cache.encoding).toBe("png");
     expect(cache.storeName).toBe("memory");
     expect(cache.namespace).toBe("ns");
     expect(cache.enabled).toBe(true);

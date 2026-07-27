@@ -151,9 +151,9 @@ await runtime.flushCache();                // force the deferred write now (e.g.
 new MaterialGraphRuntime({ document, cache: {
   enabled: true,
   store: myStore,           // bring your own (see below); default is worker+IndexedDB
-  encoding: "png",          // or "rgba8" to skip the codec
-  budgetBytes: 256 * 2 ** 20,
-  maxEntryBytes: 64 * 2 ** 20,
+  encoding: "deflate",      // or "rgba8" (cheaper saves) / "png" (smallest, slower restores)
+  budgetBytes: 256 * 2 ** 20,   // on-disk ceiling, in STORED (compressed) bytes
+  maxEntryBytes: 256 * 2 ** 20, // per-capture ceiling, in RAW texel bytes — see note below
   minBakeMs: 250,           // don't spend disk to save a bake cheaper than this
   writeDelayMs: 750,        // quiet period before the capture runs
   worker: true,             // false = main thread; { url } = self-hosted worker (strict CSP)
@@ -162,9 +162,58 @@ new MaterialGraphRuntime({ document, cache: {
 }});
 ```
 
-By default the PNG codec and all storage IO run **in a worker**, so neither encoding nor IO touches the main
-thread. Only the GPU readback is main-thread (it has to be), and it is deferred past `writeDelayMs`, skipped
-when an entry already exists, and collapsed to one capture per edit burst.
+The codec and all storage IO run **in a worker**, so neither encoding nor IO touches the main thread. Only the
+GPU readback is main-thread (it has to be), and it is deferred past `writeDelayMs`, skipped when an entry
+already exists, and collapsed to one capture per burst of re-bakes.
+
+**On `encoding`.** All three options are lossless; they trade save cost against footprint.
+
+- `"deflate"` (default) — byte compression, no image codec. Restores as fast as raw texels, and stores about
+  6× smaller. Saving costs real CPU, but it runs in the worker and does not hold the bake queue, so nothing
+  waits on it.
+- `"rgba8"` — raw texels. Cheapest to save, largest on disk.
+- `"png"` — smallest footprint, but measurably slower to restore: unpacking an image is real work, and a
+  cache exists to make the second load fast.
+
+Footprint matters more than it first looks. Raw texels run ~80 MB per material at 2048², so the default
+256 MB budget would hold roughly three materials before evicting; compressed it holds around eighteen. That is
+the difference between a cache that accumulates and one that thrashes.
+
+Lossy GPU formats (KTX2/Basis) are deliberately not offered. This cache must reproduce a bake *exactly* —
+otherwise you would author a material against one image and get a different one back on reload — and block
+compression visibly damages the data channels, normals worst of all. It would also buy nothing here: a restore
+writes into the same render targets the baker draws into, and those are uncompressed by construction.
+
+**The two size knobs are in different currencies.** `budgetBytes` is compressed bytes on disk.
+`maxEntryBytes` is *raw* texel bytes, because it gates the capture before the readback — at which point the
+stored size can't be known. Size it against raw totals:
+
+| bake size | 1 channel | 7 channels (raw) |
+| --- | --- | --- |
+| 512²  | 1 MB  | 7 MB |
+| 1024² | 4 MB  | 28 MB |
+| 2048² | 16 MB | 112 MB |
+| 4096² | 64 MB | 448 MB |
+
+PNG typically shrinks that by 10× or more, so if you set `maxEntryBytes` to the on-disk figure you have in
+mind, larger materials will silently stop being cached.
+
+### What a capture costs
+
+The readback is the one part that runs on the main thread. Measured on an M-series Mac in Chrome, per
+channel, median of 12 runs:
+
+| bake size | GPU→CPU read | row flip (JS) | total | ×7 channels |
+| --- | --- | --- | --- | --- |
+| 512²  | 1.0 ms  | 0.2 ms | 1.2 ms  | ~8 ms |
+| 1024² | 2.4 ms  | 0.6 ms | 3.0 ms  | ~21 ms |
+| 2048² | 6.3 ms  | 2.4 ms | 8.7 ms  | ~61 ms |
+| 4096² | 22.3 ms | 9.9 ms | 32.2 ms | ~225 ms |
+
+Roughly linear in bytes (~0.35 ms/MB transfer, ~0.15 ms/MB flip). This is why the capture is deferred rather
+than run inline at the end of a bake: it is work that only pays off on the *next* load, so making the current
+one wait for it would be paying now for a benefit later. De-padding is free at bake sizes that are multiples
+of 64 (the rows arrive tightly packed), which every surface bake is.
 
 ### Bring your own storage
 

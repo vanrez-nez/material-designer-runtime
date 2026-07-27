@@ -64,30 +64,34 @@ async function handleGet(id: string): Promise<{ entry: BakeCacheEntry | null; tr
   const found = await idbGet(await db(), id);
   if (!found) return { entry: null, transfer: [] };
   const { meta, data } = found;
-  const transfer: ArrayBuffer[] = [];
-  const textures = [];
-  for (const stored of data.textures) {
-    // Decode back to plain RGBA8 here, so the main thread receives texels it can hand straight to the GPU with
-    // no further work and no image-decode ambiguity.
-    const bytes = await decodeTexels(new Uint8Array(stored.bytes), meta.size, stored.encoding);
-    transfer.push(bytes.buffer as ArrayBuffer);
-    textures.push({ channel: stored.channel, encoding: "rgba8" as const, bytes });
-  }
-  return { entry: { ...meta, textures }, transfer };
+  // Decode every channel CONCURRENTLY. This is the dominant cost of a restore — image decoding is the slow
+  // part, and doing seven of them in sequence made a hit feel like a small bake. createImageBitmap hands the
+  // work to the browser's decode threads, so issuing them together overlaps what was previously serial.
+  const textures = await Promise.all(
+    data.textures.map(async (stored) => ({
+      channel: stored.channel,
+      // Decoded to plain RGBA8 here, so the main thread receives texels it can hand straight to the GPU with
+      // no further work and no image-decode ambiguity.
+      encoding: "rgba8" as const,
+      bytes: await decodeTexels(new Uint8Array(stored.bytes), meta.size, stored.encoding),
+    })),
+  );
+  return { entry: { ...meta, textures }, transfer: textures.map((t) => t.bytes.buffer as ArrayBuffer) };
 }
 
 async function handlePut(entry: BakeCacheEntry): Promise<void> {
-  const textures = [];
-  let storedBytes = 0;
-  for (const texels of entry.textures) {
-    const encoded = await encodeTexels(texels.bytes, entry.size, encoding);
-    storedBytes += encoded.bytes.byteLength;
-    textures.push({
+  // Encode concurrently, for the same reason as the decode above.
+  const encodedAll = await Promise.all(
+    entry.textures.map(async (texels) => ({
       channel: texels.channel,
-      encoding: encoded.encoding,
-      bytes: toStandaloneBuffer(encoded.bytes),
-    });
-  }
+      encoded: await encodeTexels(texels.bytes, entry.size, encoding),
+    })),
+  );
+  let storedBytes = 0;
+  const textures = encodedAll.map(({ channel, encoded }) => {
+    storedBytes += encoded.bytes.byteLength;
+    return { channel, encoding: encoded.encoding, bytes: toStandaloneBuffer(encoded.bytes) };
+  });
   // Record the size AS STORED, not the size handed to us. `metrics().bytes` and the LRU budget both read this,
   // and a "size taken" number that reported pre-compression bytes would simply be wrong.
   const meta: BakeCacheEntryMeta = { ...stripTextures(entry), bytes: storedBytes };

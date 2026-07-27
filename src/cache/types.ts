@@ -7,7 +7,12 @@ import type { PbrSocket } from "../graph/types";
 // a real bake output with its own 8-bit target, so the cache carries it as a pseudo-channel.
 export type BakeCacheChannel = PbrSocket | "height";
 
-export type BakeCacheEncoding = "png" | "rgba8";
+// How texels are stored on disk. All three are LOSSLESS — a restore must reproduce a bake exactly, or you
+// would author against one image and get a different one back.
+//   "rgba8"   raw texels. Fastest to restore (nothing to undo), largest on disk.
+//   "deflate" raw texels through the browser's byte compressor. No image decoding, so restores stay quick.
+//   "png"     smallest on disk, but unpacking an image is real work and restores are markedly slower.
+export type BakeCacheEncoding = "png" | "rgba8" | "deflate";
 
 // One channel's texels crossing the port. `bytes` is tightly-packed, top-down RGBA8 and `encoding` is
 // "rgba8" in both directions — a store is free to compress internally (the default encodes PNG), but it decodes
@@ -109,9 +114,17 @@ export interface BakeCacheOptions {
   // within a session but does not survive a reload); check `metrics().store` to see which you got.
   store?: BakeCacheStore;
   encoding?: BakeCacheEncoding;
-  // Total texel budget; LRU-evicted down to it on every write.
+  // On-disk budget, in bytes AS STORED (post-compression). LRU-evicted down to it on every write. This is
+  // the knob that governs actual footprint.
   budgetBytes?: number;
-  // Refuse to store a single bake larger than this, so one 4096² material can't consume the whole budget.
+  // Ceiling on a single capture, in RAW texel bytes (pre-compression) — a different currency from
+  // `budgetBytes`, because this gate runs BEFORE the readback, when the stored size isn't knowable yet.
+  // It bounds the transient cost of capturing: the GPU→CPU transfer and the JS buffers it allocates.
+  //
+  // Size it against raw totals, not what you expect on disk: a full 7-channel bake is ~28 MB at 1024²,
+  // ~112 MB at 2048², and ~448 MB at 4096². Setting this to the disk figure you have in mind will silently
+  // stop caching your larger materials — the compression ratio is often 10× or more, so the two numbers are
+  // nowhere near each other.
   maxEntryBytes?: number;
   // Don't spend a ~28MB readback to save a bake faster than this. The gate reads the REBUILD time, because
   // an entry's worth is the shader compile it lets you skip.

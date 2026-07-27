@@ -62,29 +62,30 @@ export function createIndexedDbCacheStore(options: IndexedDbCacheStoreOptions = 
       const found = await idbGet(await db(), id);
       if (!found) return null;
       const { meta, data } = found;
-      const textures: BakeCacheTexels[] = [];
-      for (const stored of data.textures) {
-        textures.push({
+      // Concurrent, like the worker's — image decoding dominates a restore, and seven serial decodes make a
+      // cache hit feel like a small bake.
+      const textures: BakeCacheTexels[] = await Promise.all(
+        data.textures.map(async (stored) => ({
           channel: stored.channel,
-          encoding: "rgba8",
+          encoding: "rgba8" as const,
           bytes: await decodeTexels(new Uint8Array(stored.bytes), meta.size, stored.encoding),
-        });
-      }
+        })),
+      );
       return { ...meta, textures };
     },
 
     async put(entry) {
-      const textures = [];
-      let storedBytes = 0;
-      for (const texels of entry.textures) {
-        const encoded = await encodeTexels(texels.bytes, entry.size, encoding);
-        storedBytes += encoded.bytes.byteLength;
-        textures.push({
+      const encodedAll = await Promise.all(
+        entry.textures.map(async (texels) => ({
           channel: texels.channel,
-          encoding: encoded.encoding,
-          bytes: toStandaloneBuffer(encoded.bytes),
-        });
-      }
+          encoded: await encodeTexels(texels.bytes, entry.size, encoding),
+        })),
+      );
+      let storedBytes = 0;
+      const textures = encodedAll.map(({ channel, encoded }) => {
+        storedBytes += encoded.bytes.byteLength;
+        return { channel, encoding: encoded.encoding, bytes: toStandaloneBuffer(encoded.bytes) };
+      });
       const { textures: _drop, ...rest } = entry;
       // Size AS STORED — metrics().bytes and the LRU budget both read this, and reporting pre-compression
       // bytes as "size taken" would simply be wrong.

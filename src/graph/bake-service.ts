@@ -481,6 +481,9 @@ export class MaterialBakeService {
   // At most one pending deferred write per texture set. A later bake replaces the descriptor rather than
   // queueing a second readback.
   private readonly pendingWrites = new Map<BakedTextureSet, PendingCacheWrite>();
+  // Store writes already handed to the cache and still in flight. They run OUTSIDE the serial bake queue
+  // (see runCacheWrite), so this is what flushCacheWrites awaits to promise durability.
+  private readonly pendingStores = new Set<Promise<void>>();
 
   // Wired once after renderer.init() (replaces the old per-controller attachRenderer). Surfaces that tried
   // to bake before this fall back to the live procedural material until a renderer exists.
@@ -973,7 +976,11 @@ export class MaterialBakeService {
         () => undefined,
       );
     }
+    // First drain the queue (which performs the readbacks and hands texels to the store), then wait for the
+    // store writes those kicked off — they deliberately run outside the queue, so the queue alone is not
+    // evidence of durability.
     await this.queue;
+    await Promise.all([...this.pendingStores]);
   }
 
   private async runCacheWrite(descriptor: PendingCacheWrite): Promise<void> {
@@ -1017,13 +1024,24 @@ export class MaterialBakeService {
         });
       }
       if (set.contentStamp !== stamp || set.disposed) return;
-      await cache.write(key, {
-        size: set.size,
-        channels,
-        hasHeight: includeHeight,
-        bakeMs: set.lastRebuildMs,
-        textures,
-      });
+      // Hand the texels to the store WITHOUT awaiting here. Only the readback above has to be serialised —
+      // it touches the GPU — whereas compressing and writing happen in the worker and touch nothing this
+      // queue protects. Awaiting inside the queued job would hold every subsequent bake behind the write,
+      // which for a compressing codec is seconds. Track the promise so flushCacheWrites can still guarantee
+      // durability when a caller explicitly asks for it.
+      const write = cache
+        .write(key, {
+          size: set.size,
+          channels,
+          hasHeight: includeHeight,
+          bakeMs: set.lastRebuildMs,
+          textures,
+        })
+        .catch((err: unknown) => {
+          console.warn("[bake] cache write failed:", err);
+        });
+      this.pendingStores.add(write);
+      void write.finally(() => this.pendingStores.delete(write));
     } catch (err) {
       console.warn("[bake] cache write failed:", err);
     }

@@ -11,8 +11,13 @@ import type {
   BakeCacheTexels,
 } from "./types";
 
+// On-disk ceiling, in stored (compressed) bytes.
 const DEFAULT_BUDGET_BYTES = 256 * 1024 * 1024;
-const DEFAULT_MAX_ENTRY_BYTES = 64 * 1024 * 1024;
+// Per-capture ceiling, in RAW texel bytes — see BakeCacheOptions.maxEntryBytes for why the two differ.
+// 256 MiB admits a full 7-channel bake at 2048² (112 MB raw) and a 4-channel one at 4096² (256 MB), while
+// still refusing the 448 MB readback a 7-channel 4096² bake would demand. An earlier 64 MiB default was
+// measured in the wrong currency and silently declined to cache anything above 1024² × 7.
+const DEFAULT_MAX_ENTRY_BYTES = 256 * 1024 * 1024;
 const DEFAULT_MIN_BAKE_MS = 250;
 const DEFAULT_WRITE_DELAY_MS = 750;
 
@@ -61,7 +66,18 @@ export class BakeTextureCache {
   private gcDone = false;
 
   constructor(options: BakeCacheOptions = {}) {
-    const encoding = options.encoding ?? "png";
+    // Byte-compressed by default: measured against the alternatives it restores as fast as raw texels (byte
+    // decompression is negligible next to the GPU upload) while storing ~6x smaller — smaller even than PNG,
+    // which costs noticeably more to restore because unpacking an image is real work.
+    //
+    // Size matters more than it first appears: raw texels run ~80MB per material at 2048², so a 256MB budget
+    // would hold about three materials before evicting. Compressed it holds roughly eighteen, which is the
+    // difference between a cache that accumulates and one that thrashes.
+    //
+    // The cost is CPU while saving (compression is slow), but that runs in the worker and no longer holds the
+    // bake queue, so nothing waits on it. Use "rgba8" to trade disk for cheaper saves, "png" if you want the
+    // smallest possible footprint and can accept slower restores.
+    const encoding = options.encoding ?? "deflate";
     this.ownsStore = options.store === undefined;
     this.workerOption = options.worker;
     this.store =
