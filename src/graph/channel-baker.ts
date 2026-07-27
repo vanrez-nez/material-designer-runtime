@@ -1,5 +1,15 @@
 import { QuadMesh, RenderTarget, MeshBasicNodeMaterial, type WebGPURenderer } from "three/webgpu";
-import { NoColorSpace, NearestFilter, RepeatWrapping, Scene, OrthographicCamera, type Texture } from "three";
+import {
+  NoColorSpace,
+  SRGBColorSpace,
+  NearestFilter,
+  LinearFilter,
+  LinearMipmapLinearFilter,
+  RepeatWrapping,
+  Scene,
+  OrthographicCamera,
+  type Texture,
+} from "three";
 import { vec3, vec2, sRGBTransferOETF, texture, uv, normalize } from "three/tsl";
 import type { MaterialValue, PbrSocket } from "./types";
 
@@ -101,6 +111,27 @@ function ssTargetsFor(w: number, h: number): SsTargets {
 export function makeChannelMaterial(): MeshBasicNodeMaterial {
   return new MeshBasicNodeMaterial();
 }
+
+// The sampling contract for a baked channel: colour channels are sRGB (the sampler linearises for PBR), data
+// channels stay linear; repeat-wrap plus trilinear/anisotropic mips so high-frequency procedural content
+// doesn't shimmer at grazing angles.
+//
+// Lives here, next to FIELD_CHANNELS/COLOR_CHANNELS, because it IS the colour-space convention. Applied both
+// to the bake render targets and to a DataTexture hydrated from the persistent cache, so a cached channel
+// samples identically to a freshly baked one — if these two drifted apart, a restored material would light
+// differently from a baked one and the cause would be near-invisible.
+export function configureChannelTexture(t: Texture, ch: PbrSocket | "height"): void {
+  t.colorSpace =
+    ch !== "height" && COLOR_CHANNELS.includes(ch as PbrSocket) ? SRGBColorSpace : NoColorSpace;
+  t.wrapS = t.wrapT = RepeatWrapping;
+  t.generateMipmaps = true;
+  t.minFilter = LinearMipmapLinearFilter;
+  t.magFilter = LinearFilter;
+  t.anisotropy = MAX_ANISOTROPY;
+}
+
+// Anisotropic-filter taps for baked channel textures (within every desktop GPU's cap; the driver clamps down).
+export const MAX_ANISOTROPY = 8;
 
 // One throwaway scene of fullscreen quads used ONLY to pre-compile bake pipelines (never rendered from).
 // QuadMesh shares one module geometry, and three's render pipeline cache key is (shader stages, material

@@ -1,4 +1,8 @@
-export { MaterialGraphRuntime, type MaterialGraphRuntimeOptions } from "./runtime";
+export {
+  MaterialGraphRuntime,
+  type CachedChannelTextures,
+  type MaterialGraphRuntimeOptions,
+} from "./runtime";
 export {
   MATERIAL_DOCUMENT_VERSION,
   MaterialGraphSession,
@@ -6,7 +10,9 @@ export {
   createDefaultMaterialDocument,
   migrateMaterialDocument,
 } from "./document";
-export { createMaterialTopologyKey } from "./topology";
+export { MATERIAL_RUNTIME_VERSION } from "./version";
+export { canonicalStringify, createMaterialParamKey, createMaterialTopologyKey } from "./topology";
+export * from "./cache";
 
 export {
   MaterialBakeService,
@@ -34,6 +40,17 @@ export {
   type MaterialConfig,
 } from "./graph/compiler";
 export { buildMeshMaterial, type ChannelTextures } from "./graph/mesh-material";
+export {
+  channelByteLength,
+  channelDataTexture,
+  depadRows,
+  disposeTransferPool,
+  flipRows,
+  paddedBytesPerRow,
+  readTargetTexels,
+  transferPoolInfo,
+  writeTargetTexels,
+} from "./graph/texture-transfer";
 export {
   NodeRegistry,
   createDefaultRegistry,

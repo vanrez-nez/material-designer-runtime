@@ -71,6 +71,9 @@ export class TexturedSurface {
   // "Regenerate": on the next rebuild, throw away the whole baked texture set (channel + decomposition-cache
   // targets/materials) and bake a fresh one — a from-scratch flush of all cached GPU state for this material.
   private flushRequested = false;
+  // Paired with flushRequested: Regenerate must also skip the PERSISTENT cache read, or it would restore the
+  // very texels the user asked to rebuild. The write still happens, so Regenerate refreshes the stored entry.
+  private bypassCacheOnce = false;
   private readonly listeners = new Set<() => void>();
   // Fired whenever the baked channel textures change content (every rebuild AND every uniform re-render),
   // so a consumer that samples the baked textures directly (the 2D preview) knows to re-render. Distinct
@@ -190,6 +193,7 @@ export class TexturedSurface {
   // that's already running. Use when caches may be stale/corrupt; heavier than a normal re-bake.
   regenerate(): void {
     this.flushRequested = true;
+    this.bypassCacheOnce = true;
     this.requestUpdate("rebuild");
   }
 
@@ -336,6 +340,9 @@ export class TexturedSurface {
       this.lastError_ = this.graph.lastError;
       // Baked channel textures changed content (same objects, new pixels) — tell direct consumers to redraw.
       this.notifyTexturesUpdated();
+      // Re-schedule the deferred cache capture so what lands on disk is the state the user settled on, not the
+      // pre-drag one. Each edit resets the timer, so a drag writes once when it stops.
+      this.service.scheduleCacheWrite(this.set, this.graph, { source: this.source });
     } catch (err) {
       this.lastError_ = err instanceof Error ? err.message : String(err);
       console.warn("[textured-surface] re-render failed:", this.lastError_);
@@ -348,6 +355,12 @@ export class TexturedSurface {
   // multiple of 64 so the service's readback alignment holds even for odd authored values.
   private surfaceBakeSize(): number {
     return Math.max(64, Math.round(readOutputResolution(this.graph.document) / 64) * 64);
+  }
+
+  // The size this surface bakes at. Public so a consumer (and the runtime facade, to build a cache key) can
+  // ask without re-deriving the rounding rule.
+  get bakeSize(): number {
+    return this.surfaceBakeSize();
   }
 
   // Re-derive the presented material. Offline (with a renderer): bake the graph into the texture set via the
@@ -388,11 +401,14 @@ export class TexturedSurface {
           this.matSig = sig;
         }
         const soloNodeId = this.graph.soloNode ?? undefined;
+        const bypassCache = this.bypassCacheOnce;
+        this.bypassCacheOnce = false;
         const t0 = performance.now();
         const changed = await this.service.bakeInto(this.set, this.graph, {
           soloNodeId,
           label: "surface",
           source: this.source,
+          bypassCache,
         });
         this.lastBakeMs = performance.now() - t0;
         if (changed || !this.wiredOnce || familyChanged) {

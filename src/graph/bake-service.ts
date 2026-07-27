@@ -9,9 +9,18 @@ import {
   compileMaterialsAsync,
   makeChannelMaterial,
   ssPoolInfo,
-  COLOR_CHANNELS,
+  configureChannelTexture,
 } from "./channel-baker";
 import { countGraphNodes, type CacheEntry, type CacheSizing, type ParamUsage } from "./compiler";
+import {
+  channelByteLength,
+  readTargetTexels,
+  transferPoolInfo,
+  writeTargetTexels,
+} from "./texture-transfer";
+import type { BakeTextureCache } from "../cache/bake-cache";
+import { createBakeCacheKey, type BakeCacheKey } from "../cache/key";
+import type { BakeCacheChannel, BakeCacheMetrics, BakeCacheTexels } from "../cache/types";
 import {
   profilableNodes,
   deriveMarginals,
@@ -33,8 +42,6 @@ import { uniformArray } from "three/tsl";
 type GPUQueueLike = { onSubmittedWorkDone?: () => Promise<void> };
 
 const BAKE_SIZE = 1024;
-// Anisotropic-filter taps for baked channel textures (within every desktop GPU's cap; driver clamps down).
-const MAX_ANISOTROPY = 8;
 // Hard cap on a decomposition cache's pixel size. Keeps a supersampled derivative cache within the WebGPU
 // guaranteed `maxTextureDimension2D` (8192) with headroom, and reflects that a high output already resolves
 // fine grain — at output 2048 a 2× cache is 4096; at 4096 the cap makes it effectively single-sample.
@@ -84,14 +91,9 @@ export const SURFACE_CHANNELS: PbrSocket[] = [
 function makeChannelTarget(ch: PbrSocket | "height", size: number): RenderTarget {
   // Color-only bake pass — no depth test — so skip the (default) depth/stencil attachment.
   const rt = new RenderTarget(size, size, { depthBuffer: false, stencilBuffer: false });
-  const t = rt.texture;
-  t.colorSpace =
-    ch !== "height" && COLOR_CHANNELS.includes(ch as PbrSocket) ? THREE.SRGBColorSpace : THREE.NoColorSpace;
-  t.wrapS = t.wrapT = THREE.RepeatWrapping;
-  t.generateMipmaps = true;
-  t.minFilter = THREE.LinearMipmapLinearFilter;
-  t.magFilter = THREE.LinearFilter;
-  t.anisotropy = MAX_ANISOTROPY;
+  // The sampling/colour-space contract lives in channel-baker, shared with the cache's DataTexture hydration
+  // so a restored channel samples exactly like a baked one.
+  configureChannelTexture(rt.texture, ch);
   return rt;
 }
 
@@ -123,6 +125,9 @@ export interface BakeOptions {
   // Identifies which surface this bake belongs to, so UI can scope its progress
   // readout to one material. Forwarded onto every BakeReport.
   source?: string;
+  // Skip the persistent cache READ and bake for real. The write still happens, which is exactly what
+  // "Regenerate" / rebuildCache() need: refresh the stored entry from a genuine bake.
+  bypassCache?: boolean;
 }
 
 // Per-run bake telemetry for the editor's progress widget. Emitted as a rebuild moves through its phases;
@@ -133,8 +138,9 @@ export interface BakeReport {
   runId: number;
   source: string | undefined;
   // 'nodes' = rebuild started (graph compiled); 'shaders' = pipelines compiling; 'render' = uniform
-  // re-render started (no recompile); 'done' = finished.
-  phase: "nodes" | "shaders" | "render" | "done";
+  // re-render started (no recompile); 'restore' = texels came from the persistent cache (no compile, no
+  // render); 'done' = finished.
+  phase: "nodes" | "shaders" | "render" | "restore" | "done";
   nodeCount: number; // graph nodes recompiled (0 for a uniform re-render)
   compileMs: number; // graph (TSL) compile time
   texturesTotal: number; // channels being regenerated this run
@@ -176,6 +182,25 @@ export class BakedTextureSet {
   present = new Set<PbrSocket>();
   signature = "";
 
+  // True when the texels were RESTORED from the persistent cache rather than rendered. In that state
+  // `mats` / `uniforms` / `paramUsage` / `cachePlan` are all EMPTY (a restore skips compileBundle entirely —
+  // that is the whole point, since the compile is the 3.6-4.6s cost), so:
+  //   - there is no uniform re-render fast path; the next edit of any kind must be a full rebuild. That
+  //     happens automatically: updateOfflineUniform routes off paramUsage, finds nothing, and requests a
+  //     rebuild — the same self-healing path releaseCaches() already relies on.
+  //   - rerenderInto MUST refuse to run, or it would draw never-compiled (colorNode-less) materials as black
+  //     over perfectly good restored texels.
+  restored = false;
+  // Bumped on every bake / re-render / restore. A deferred cache write captures the stamp it was scheduled
+  // for and aborts if it no longer matches, so a burst of edits costs one readback instead of one per edit.
+  contentStamp = 0;
+  // Wall time of the last full rebuild. This — not the last render — is what an entry is worth, because a
+  // cache hit buys back the compile. Feeds the minBakeMs gate and is stored on the entry.
+  lastRebuildMs = 0;
+  // Set by dispose(). A transient set from bake() may be disposed by its caller before a deferred write
+  // fires, and reading a disposed target is a WebGPU error.
+  disposed = false;
+
   size: number;
 
   constructor(
@@ -195,6 +220,9 @@ export class BakedTextureSet {
   resize(size: number): void {
     if (size === this.size) return;
     this.size = size;
+    // The restored texels were for the old size, and flushCaches() below drops the compile state anyway.
+    this.restored = false;
+    this.contentStamp += 1;
     for (const rt of this.targets.values()) {
       rt.setSize(size, size);
       rt.texture.needsUpdate = true;
@@ -298,6 +326,18 @@ export class BakedTextureSet {
     return this.targets.get(ch)?.texture ?? null;
   }
 
+  // Record which channels this set now holds and fold them into the rewire signature. Returns true when the
+  // signature changed, i.e. the caller must rewire its samplers. Shared by the bake and the cache-restore
+  // paths so the two can never disagree on what "changed" means.
+  setPresence(present: Set<PbrSocket>, hasHeight: boolean): boolean {
+    const signature = [...present].sort().join(",") + (hasHeight ? "|h" : "");
+    const changed = signature !== this.signature;
+    this.present = present;
+    this.hasHeight = hasHeight;
+    this.signature = signature;
+    return changed;
+  }
+
   // Flush intermediate GPU caches and force a full channel recompile on the next bake, WITHOUT touching the
   // channel/height TARGET textures the live surface samples. Destroying a target the render loop still has
   // bound is a WebGPU error ("Destroyed texture used in a submit"), so "Regenerate" re-bakes into the same
@@ -351,10 +391,14 @@ export class BakedTextureSet {
       cacheMats: this.cacheMats.size,
       constArrays: this.constArrays.size,
       heightTarget: this.heightTarget ? 1 : 0,
+      restored: this.restored ? 1 : 0,
     };
   }
 
   flushCaches(): void {
+    // Whatever compile state existed is gone, so the set is no longer "restored" in the sense of holding
+    // cache texels paired with an empty compile — a caller that restores AFTER this sets the flag itself.
+    this.restored = false;
     for (const m of this.mats.values()) m.dispose();
     this.mats.clear();
     for (const rt of this.cacheTargets.values()) rt.dispose();
@@ -368,6 +412,10 @@ export class BakedTextureSet {
   }
 
   dispose(): void {
+    // Latched before anything is freed, so a deferred cache write that fires later reads it and bails instead
+    // of reading back a destroyed target.
+    this.disposed = true;
+    this.restored = false;
     for (const rt of this.targets.values()) rt.dispose();
     this.targets.clear();
     for (const m of this.mats.values()) m.dispose();
@@ -389,6 +437,16 @@ export interface BakeProgress {
   completed: number;
   total: number;
   active: string | null;
+}
+
+// A deferred cache capture. `stamp` is the set's contentStamp at scheduling time; if it has moved on by the
+// time the timer fires, newer texels exist and this capture is dropped.
+interface PendingCacheWrite {
+  set: BakedTextureSet;
+  graph: MaterialGraphSource;
+  opts: BakeOptions;
+  stamp: number;
+  timer: ReturnType<typeof setTimeout>;
 }
 
 export class MaterialBakeService {
@@ -417,6 +475,12 @@ export class MaterialBakeService {
   // Reused across calls; recreated when the readback size changes.
   private readonly scratchCaches = new Map<string, { rt: RenderTarget; mat: MeshBasicNodeMaterial }>();
   private scratchCacheSize = 0;
+  // Opt-in cross-session texel cache. Null until a consumer installs one, and every use of it is optional —
+  // baking must behave identically when it is absent or failing.
+  private cache_: BakeTextureCache | null = null;
+  // At most one pending deferred write per texture set. A later bake replaces the descriptor rather than
+  // queueing a second readback.
+  private readonly pendingWrites = new Map<BakedTextureSet, PendingCacheWrite>();
 
   // Wired once after renderer.init() (replaces the old per-controller attachRenderer). Surfaces that tried
   // to bake before this fall back to the live procedural material until a renderer exists.
@@ -484,6 +548,10 @@ export class MaterialBakeService {
     return this.enqueue(opts.label ?? "surface", async () => {
       const renderer = this.renderer;
       if (!renderer) return false;
+      // Try the persistent cache FIRST — ahead of compileBundle below, which is the only placement that buys
+      // anything. The render is ~60-80ms; the pipeline compile it precedes is 3.6-4.6s.
+      const restored = await this.tryRestoreFromCache(renderer, set, graph, opts);
+      if (restored) return restored.changed;
       const tCompile0 = performance.now();
       // Decompose: each group's outputs are baked to their own intermediate textures (allocCache hands the
       // compiler the cache texture to sample downstream) so no channel shader inlines the whole graph.
@@ -577,10 +645,7 @@ export class MaterialBakeService {
       const tDispatch0 = performance.now();
       for (const j of jobs) renderMaterialToTarget(renderer, j.mat, j.target, j.isNormal);
       const dispatchMs = performance.now() - tDispatch0;
-      const signature = [...present].sort().join(",") + (set.hasHeight ? "|h" : "");
-      const changed = signature !== set.signature;
-      set.present = present;
-      set.signature = signature;
+      const changed = set.setPresence(present, set.hasHeight);
       // Wait for the GPU to actually finish before resolving — gives the caller real back-pressure so it
       // can't submit the next bake while this one is still executing (the cause of the editing GPU backlog).
       const tGpu0 = performance.now();
@@ -598,6 +663,10 @@ export class MaterialBakeService {
             `dispatch=${dispatchMs.toFixed(1)} gpuWait=${gpuWaitMs.toFixed(1)} total=${totalMs.toFixed(1)}ms`,
         );
       }
+      set.restored = false; // these texels were genuinely rendered, so the fast paths are live again
+      set.contentStamp += 1;
+      set.lastRebuildMs = totalMs;
+      this.scheduleCacheWrite(set, graph, opts);
       return changed;
     });
   }
@@ -625,6 +694,11 @@ export class MaterialBakeService {
     const run = this.queue.then(async () => {
       const renderer = this.renderer;
       if (!renderer) return;
+      // A cache-restored set has NO compiled channel materials: channelMaterial() would lazily hand back a
+      // MeshBasicNodeMaterial with no colorNode, and rendering it would paint black over good texels. The
+      // surface can't reach here (its paramUsage is empty, so every edit routes to a rebuild), but this method
+      // is public, so refuse rather than trust the caller.
+      if (set.restored) return;
       const total = set.present.size + (set.hasHeight && set.heightTarget ? 1 : 0);
       // Uniform re-render: no recompile (nodeCount 0), only the channel renders are regenerated.
       const report: BakeReport = {
@@ -665,6 +739,9 @@ export class MaterialBakeService {
           `[bake-prof] rerender dispatch=${dispatchMs.toFixed(1)} gpuWait=${gpuWaitMs.toFixed(1)}ms`,
         );
       }
+      // New texel content (same objects, new values) — supersede any pending write so the cache ends up
+      // holding what the user actually settled on, not the mid-drag state.
+      set.contentStamp += 1;
     });
     this.queue = run.then(
       () => undefined,
@@ -738,7 +815,218 @@ export class MaterialBakeService {
       scratchTarget: this.scratch ? `${this.scratchSize}px` : "none",
       scratchCaches: this.scratchCaches.size,
       ssPool: ssPoolInfo(),
+      // Cache-restore staging textures. Bounded by (size × colorSpace), so growth past a handful is a leak.
+      transferPool: transferPoolInfo(),
+      cache: this.cache_ ? this.cache_.info() : "off",
     };
+  }
+
+  // --- persistent texel cache -------------------------------------------------------------------
+  // Install (or remove) the cross-session cache. Opt-in: with none installed, nothing is read, written, or
+  // stored, and every code path below is a no-op.
+  setCache(cache: BakeTextureCache | null): void {
+    this.cache_ = cache;
+  }
+
+  get cache(): BakeTextureCache | null {
+    return this.cache_;
+  }
+
+  cacheMetrics(): Promise<BakeCacheMetrics | null> {
+    return this.cache_ ? this.cache_.metrics() : Promise.resolve(null);
+  }
+
+  // Build the identity of baking `graph` at `size` into `channels`. Exposed so a consumer can key their own
+  // cache exactly as the runtime does.
+  cacheKeyFor(
+    graph: MaterialGraphSource,
+    size: number,
+    channels: readonly BakeCacheChannel[] = SURFACE_CHANNELS,
+  ): BakeCacheKey {
+    return createBakeCacheKey({
+      document: graph.document,
+      registry: graph.getRegistry(),
+      size,
+      channels,
+      namespace: this.cache_?.namespace,
+    });
+  }
+
+  // Restore `set`'s texels from the cache. Returns null for a miss (or any failure), which means "bake for
+  // real"; the caller must treat null as ordinary. Never throws.
+  private async tryRestoreFromCache(
+    renderer: WebGPURenderer,
+    set: BakedTextureSet,
+    graph: MaterialGraphSource,
+    opts: BakeOptions,
+  ): Promise<{ changed: boolean } | null> {
+    const cache = this.cache_;
+    // A solo bake is a transient preview and deliberately omits the group caches — never cache or restore it.
+    if (!cache?.enabled || opts.bypassCache || opts.soloNodeId) return null;
+    try {
+      const t0 = performance.now();
+      const key = this.cacheKeyFor(graph, set.size, opts.channels ?? set.channels);
+      const entry = await cache.read(key);
+      if (!entry) return null;
+      // Guard against a record that no longer fits this set. Size is in the key, so a mismatch means a stale
+      // or hand-edited record; drop it rather than attempting a rescaling copy.
+      const expected = channelByteLength(set.size);
+      const wanted = new Set<BakeCacheChannel>(opts.channels ?? set.channels);
+      const usable =
+        entry.size === set.size &&
+        entry.textures.length > 0 &&
+        entry.textures.every(
+          (t) =>
+            (t.channel === "height" || wanted.has(t.channel)) && t.bytes.length === expected,
+        );
+      if (!usable) {
+        await cache.delete(key);
+        return null;
+      }
+      // Drop every scrap of compile state. Without this, a stale paramUsage left over from a PREVIOUS document
+      // baked into this same set would let the next param edit take the re-render fast path and redraw the old
+      // document's materials — silently wrong textures. This also puts the set in exactly the state
+      // releaseCaches() produces, whose self-healing behaviour is already documented and relied upon.
+      set.flushCaches();
+      const present = new Set<PbrSocket>();
+      let hasHeight = false;
+      for (const texels of entry.textures) {
+        if (texels.channel === "height") {
+          writeTargetTexels(renderer, set.ensureHeightTarget(), texels.bytes);
+          hasHeight = true;
+          continue;
+        }
+        writeTargetTexels(renderer, set.target(texels.channel), texels.bytes);
+        present.add(texels.channel);
+      }
+      const report: BakeReport = {
+        runId: ++this.bakeRunId,
+        source: opts.source,
+        phase: "restore",
+        nodeCount: 0,
+        compileMs: 0,
+        texturesTotal: entry.textures.length,
+        totalMs: 0,
+      };
+      this.emitReport(report);
+      const changed = set.setPresence(present, hasHeight);
+      set.restored = true;
+      set.contentStamp += 1;
+      // Same back-pressure contract as a bake: resolve only once the GPU has actually finished, so the caller
+      // can't submit a frame that samples a half-copied texture.
+      await this.gpuSync(set.firstTarget());
+      const totalMs = performance.now() - t0;
+      this.emitReport({ ...report, phase: "done", totalMs });
+      if (BAKE_PROFILE) {
+        console.log(
+          `[bake-prof] restore channels=${entry.textures.length} bytes=${entry.bytes} ` +
+            `savedBake=${entry.bakeMs.toFixed(0)}ms total=${totalMs.toFixed(1)}ms`,
+        );
+      }
+      return { changed };
+    } catch (err) {
+      // A cache problem must never become a bake problem: fall through and bake for real.
+      console.warn("[bake] cache restore failed, baking instead:", err);
+      return null;
+    }
+  }
+
+  // Queue a deferred capture of `set`'s texels. Deferred rather than inline because the readback is ~28MB at
+  // 1024² across 7 channels and forces a GPU sync — paying that on every structural edit would make editing
+  // worse, which is the opposite of the point.
+  scheduleCacheWrite(set: BakedTextureSet, graph: MaterialGraphSource, opts: BakeOptions = {}): void {
+    const cache = this.cache_;
+    if (!cache?.enabled || opts.soloNodeId || !this.renderer || set.disposed) return;
+    const existing = this.pendingWrites.get(set);
+    if (existing) clearTimeout(existing.timer);
+    const descriptor: PendingCacheWrite = {
+      set,
+      graph,
+      opts,
+      stamp: set.contentStamp,
+      timer: setTimeout(() => {
+        this.pendingWrites.delete(set);
+        // Appended to the serial queue DIRECTLY rather than through enqueue(): a background write must not
+        // show up in the visible N-of-M progress counter or log a [bake] line (see rerenderInto).
+        const run = this.queue.then(() => this.runCacheWrite(descriptor));
+        this.queue = run.then(
+          () => undefined,
+          () => undefined,
+        );
+      }, cache.writeDelayMs),
+    };
+    this.pendingWrites.set(set, descriptor);
+  }
+
+  // Run every pending deferred write now and wait for it. `rebuildCache()` needs this so it can promise the
+  // fresh entry is durable by the time it resolves.
+  async flushCacheWrites(): Promise<void> {
+    const pending = [...this.pendingWrites.values()];
+    this.pendingWrites.clear();
+    // Append to the serial queue rather than running inline: a readback must not overlap an in-flight bake
+    // that is still writing the very targets it reads.
+    for (const descriptor of pending) {
+      clearTimeout(descriptor.timer);
+      const run = this.queue.then(() => this.runCacheWrite(descriptor));
+      this.queue = run.then(
+        () => undefined,
+        () => undefined,
+      );
+    }
+    await this.queue;
+  }
+
+  private async runCacheWrite(descriptor: PendingCacheWrite): Promise<void> {
+    const { set, graph, opts, stamp } = descriptor;
+    const cache = this.cache_;
+    const renderer = this.renderer;
+    if (!cache?.enabled || !renderer || set.disposed) return;
+    // Superseded: newer texels have landed (or are about to), so this capture would store stale content.
+    // This is what collapses a slider-drag burst into a single readback.
+    if (set.contentStamp !== stamp) return;
+    // Restored texels came FROM the cache — writing them back would be pure cost.
+    if (set.restored) return;
+    try {
+      const channels = (opts.channels ?? set.channels).filter((ch) => set.present.has(ch));
+      const includeHeight = set.hasHeight && set.heightTarget !== null;
+      const count = channels.length + (includeHeight ? 1 : 0);
+      if (count === 0) return;
+      const bytes = channelByteLength(set.size) * count;
+      // Ask policy BEFORE reading anything back: the readback is the expensive part, and there is no sense
+      // paying it for a write that maxEntryBytes / minBakeMs would reject.
+      if (!cache.canWrite(set.lastRebuildMs, bytes)) return;
+      const key = this.cacheKeyFor(graph, set.size, opts.channels ?? set.channels);
+      // Already stored (the common reload-then-idle case): bump LRU position and skip the readback entirely.
+      if (await cache.peek(key)) return;
+      const textures: BakeCacheTexels[] = [];
+      for (const ch of channels) {
+        textures.push({
+          channel: ch,
+          encoding: "rgba8",
+          bytes: await readTargetTexels(renderer, set.target(ch)),
+        });
+        // Re-check between channels: a readback awaits, so an edit can land mid-capture and make the rest of
+        // these channels inconsistent with the first ones.
+        if (set.contentStamp !== stamp || set.disposed) return;
+      }
+      if (includeHeight) {
+        textures.push({
+          channel: "height",
+          encoding: "rgba8",
+          bytes: await readTargetTexels(renderer, set.heightTarget!),
+        });
+      }
+      if (set.contentStamp !== stamp || set.disposed) return;
+      await cache.write(key, {
+        size: set.size,
+        channels,
+        hasHeight: includeHeight,
+        bakeMs: set.lastRebuildMs,
+        textures,
+      });
+    } catch (err) {
+      console.warn("[bake] cache write failed:", err);
+    }
   }
 
   private scratchTarget(size: number): RenderTarget {
