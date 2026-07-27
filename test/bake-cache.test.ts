@@ -246,10 +246,22 @@ describe("bake cache key", () => {
   });
 
   // The cache key embeds the runtime version so that node-maths changes (which ship without a document-schema
-  // bump) orphan stale entries. A release that bumps package.json but forgets version.ts would silently serve
-  // pre-fix texels, so fail the build here instead.
-  it("keeps MATERIAL_RUNTIME_VERSION in step with package.json", () => {
+  // bump) orphan stale entries rather than silently restoring pre-fix texels. The version is derived from
+  // package.json, so what needs guarding is no longer "are the two in sync" but "did the derivation survive" —
+  // an empty or undefined version would collapse every release into one cache namespace.
+  it("carries a real package version into the cache key", () => {
     expect(MATERIAL_RUNTIME_VERSION).toBe(pkg.version);
+    expect(MATERIAL_RUNTIME_VERSION).toMatch(/^\d+\.\d+\.\d+/);
+    const key = keyFor(tweakableDoc());
+    expect(key.id).toContain(MATERIAL_RUNTIME_VERSION);
+  });
+
+  it("orphans entries from a different runtime version", () => {
+    // Two builds of the library must never share a cache entry, because the same document can bake to
+    // different texels across versions. The id prefix is what enforces that.
+    const key = keyFor(tweakableDoc());
+    expect(key.id.startsWith(BAKE_CACHE_SCHEMA)).toBe(true);
+    expect(BAKE_CACHE_SCHEMA).toContain(MATERIAL_RUNTIME_VERSION);
   });
 });
 
