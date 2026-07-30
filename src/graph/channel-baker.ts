@@ -142,14 +142,14 @@ const compileScene = new Scene();
 const compileCamera = new OrthographicCamera(-1, 1, 1, -1, 0, 1);
 const compileQuads: QuadMesh[] = [];
 
-// Pre-compile every channel's render pipeline OFF the blocking path, IN PARALLEL. The normal render path
+// Pre-compile every channel's render pipeline OFF the blocking path. The normal render path
 // (`bakeQuad.render`) hits three's synchronous `device.createRenderPipeline`, which on Dawn/Metal defers
 // the heavy shader compile to submit time and pegs the GPU process — a single structural edit on a heavy
 // graph freezes the editor for seconds. `renderer.compileAsync` instead routes through
-// `createRenderPipelineAsync` (non-blocking) and, given a scene of N materials, fires all N compiles then
-// awaits them together — so wall time is ~max(channel) instead of the serial sum. After this resolves the
-// per-channel `renderMaterialToTarget` calls find warm pipelines and render in ~ms. Caller must serialise:
-// a single `compileAsync` manages shared renderer state safely, but two concurrent ones would clobber it.
+// `createRenderPipelineAsync` (non-blocking). Three r184 deliberately processes scene work items
+// sequentially, yielding between them, so this improves responsiveness but is not channel-parallel
+// compilation. After it resolves the per-channel renders find warm pipelines and finish in ~ms. Caller must
+// serialise: one `compileAsync` manages shared renderer state safely, but two concurrent calls would clobber it.
 export async function compileMaterialsAsync(
   renderer: WebGPURenderer,
   materials: MeshBasicNodeMaterial[],

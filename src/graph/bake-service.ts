@@ -623,11 +623,9 @@ export class MaterialBakeService {
       }
       let precompileMs = 0;
       if (ASYNC_PIPELINE_COMPILE) {
-        // Chromium/Dawn: compile the (changed) channel pipelines asynchronously and IN PARALLEL (one
-        // compileAsync over all channel materials) — non-blocking, so the heavy shader compile doesn't
-        // freeze the editor, and wall time is ~max(channel) not the serial sum. The gate pauses the app's
-        // animate render for this window only (compileAsync's await is the one place a concurrent render
-        // would corrupt shared renderer state); the synchronous renders below can't interleave.
+        // Three r184 processes compileAsync work items sequentially, yielding between them. This keeps the
+        // editor responsive but is not channel-parallel compilation. The gate still protects Three's shared
+        // renderer state throughout that asynchronous window.
         this.emitReport({ ...report, phase: "shaders" }); // pipelines compiling (the dominant phase)
         const tPrecompile0 = performance.now();
         this.compileGateDepth += 1;
