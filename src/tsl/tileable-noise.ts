@@ -1,4 +1,4 @@
-import { Break, Fn, If, Loop, vec2, vec3, vec4, floor, fract, mod, abs, dot, mix, float, fwidth, smoothstep, clamp, max, min } from "three/tsl";
+import { Break, Fn, If, Loop, vec2, vec3, vec4, floor, fract, mod, abs, mix, float, fwidth, smoothstep, clamp, max, min } from "three/tsl";
 import type { MaterialValue } from "../graph/types";
 
 // Tileable 2D noise via Gustavson's periodic classic Perlin ("pnoise", webgl-noise, MIT). `mod(Pi, rep)`
@@ -13,34 +13,28 @@ const fadeDerivative = (t: V): V => t.mul(t).mul(t.sub(1)).mul(t.sub(1)).mul(30)
 
 // Periodic Perlin noise at P with integer period `rep` (vec2). Returns ~[-1, 1].
 export const pnoise2 = Fn(([P, rep]: V[]): V => {
-  const Pi0 = floor(P.xyxy).add(vec4(0, 0, 1, 1)) as V;
-  const Pf = fract(P.xyxy).sub(vec4(0, 0, 1, 1)) as V;
+  // Lattice setup. floor/fract are taken on the vec2 and then broadcast: `floor(P.xyxy)` asks for four
+  // lanes when only two are distinct.
+  const Pi0 = (floor(P) as V).xyxy.add(vec4(0, 0, 1, 1)) as V;
+  const Pf = (fract(P) as V).xyxy.sub(vec4(0, 0, 1, 1)) as V;
   const Pi = mod(mod(Pi0, rep.xyxy), 289) as V; // periodic wrap, then keep the hash in range
-  const ix = Pi.xzxz;
-  const iy = Pi.yyww;
+  // The outer permute's input is Pi.xzxz — two distinct values in four lanes. Permuting the vec2 and
+  // broadcasting afterwards halves that step, and each permute carries a modulo (a division on the GPU).
+  const i = permute(permute(Pi.xz).xyxy.add(Pi.yyww));
   const fx = Pf.xzxz;
   const fy = Pf.yyww;
-  const i = permute(permute(ix).add(iy));
   const gx0 = fract(i.mul(0.0243902439)).mul(2).sub(1) as V; // 1/41
   const gy = abs(gx0).sub(0.5) as V;
   const gx = gx0.sub(floor(gx0.add(0.5))) as V;
-  let g00 = vec2(gx.x, gy.x) as V;
-  let g10 = vec2(gx.y, gy.y) as V;
-  let g01 = vec2(gx.z, gy.z) as V;
-  let g11 = vec2(gx.w, gy.w) as V;
+  // The four corner gradients stay in vec4 lanes (00,10,01,11) rather than being repacked into four vec2s.
+  // Each lane's dot(g,g) is then just gx²+gy², and the Taylor normalisation folds into the gradient dot
+  // below instead of scaling both gradient components first — same value, roughly half the shuffling.
   const norm = float(1.79284291400159).sub(
-    float(0.85373472095314).mul(vec4(dot(g00, g00), dot(g01, g01), dot(g10, g10), dot(g11, g11))),
+    float(0.85373472095314).mul(gx.mul(gx).add(gy.mul(gy))),
   ) as V;
-  g00 = g00.mul(norm.x);
-  g01 = g01.mul(norm.y);
-  g10 = g10.mul(norm.z);
-  g11 = g11.mul(norm.w);
-  const n00 = dot(g00, vec2(fx.x, fy.x));
-  const n10 = dot(g10, vec2(fx.y, fy.y));
-  const n01 = dot(g01, vec2(fx.z, fy.z));
-  const n11 = dot(g11, vec2(fx.w, fy.w));
+  const n = gx.mul(fx).add(gy.mul(fy)).mul(norm) as V; // (n00, n10, n01, n11)
   const fadexy = fade(Pf.xy) as V;
-  const n_x = mix(vec2(n00, n01), vec2(n10, n11), fadexy.x) as V;
+  const n_x = mix(vec2(n.x, n.z), vec2(n.y, n.w), fadexy.x) as V;
   return mix(n_x.x, n_x.y, fadexy.y).mul(2.3);
 }).setLayout({
   // A LAYOUT, not decoration: without one, TSL inlines this whole body at EVERY call site, and the call
@@ -61,43 +55,33 @@ export const pnoise2 = Fn(([P, rep]: V[]): V => {
 // opt-in visual-performance primitive for flow-warp presets: it replaces four finite-difference samples with
 // one analytic sample. The default kernels keep their old finite-difference look.
 export const pnoise2Gradient = Fn(([P, rep]: V[]): V => {
-  const Pi0 = floor(P.xyxy).add(vec4(0, 0, 1, 1)) as V;
-  const Pf = fract(P.xyxy).sub(vec4(0, 0, 1, 1)) as V;
+  // Same lane restructure as pnoise2 above; the derivative terms need the normalised gradient components
+  // individually, so `norm` is applied to gx/gy here rather than folded into the dot.
+  const Pi0 = (floor(P) as V).xyxy.add(vec4(0, 0, 1, 1)) as V;
+  const Pf = (fract(P) as V).xyxy.sub(vec4(0, 0, 1, 1)) as V;
   const Pi = mod(mod(Pi0, rep.xyxy), 289) as V;
-  const ix = Pi.xzxz;
-  const iy = Pi.yyww;
+  const i = permute(permute(Pi.xz).xyxy.add(Pi.yyww));
   const fx = Pf.xzxz;
   const fy = Pf.yyww;
-  const i = permute(permute(ix).add(iy));
   const gx0 = fract(i.mul(0.0243902439)).mul(2).sub(1) as V;
   const gy = abs(gx0).sub(0.5) as V;
   const gx = gx0.sub(floor(gx0.add(0.5))) as V;
-  let g00 = vec2(gx.x, gy.x) as V;
-  let g10 = vec2(gx.y, gy.y) as V;
-  let g01 = vec2(gx.z, gy.z) as V;
-  let g11 = vec2(gx.w, gy.w) as V;
   const norm = float(1.79284291400159).sub(
-    float(0.85373472095314).mul(vec4(dot(g00, g00), dot(g01, g01), dot(g10, g10), dot(g11, g11))),
+    float(0.85373472095314).mul(gx.mul(gx).add(gy.mul(gy))),
   ) as V;
-  g00 = g00.mul(norm.x);
-  g01 = g01.mul(norm.y);
-  g10 = g10.mul(norm.z);
-  g11 = g11.mul(norm.w);
-
-  const n00 = dot(g00, vec2(fx.x, fy.x));
-  const n10 = dot(g10, vec2(fx.y, fy.y));
-  const n01 = dot(g01, vec2(fx.z, fy.z));
-  const n11 = dot(g11, vec2(fx.w, fy.w));
+  const gxn = gx.mul(norm) as V; // normalised gradient x per corner (00,10,01,11)
+  const gyn = gy.mul(norm) as V;
+  const n = gxn.mul(fx).add(gyn.mul(fy)) as V; // (n00, n10, n01, n11)
   const fadeXY = fade(Pf.xy) as V;
   const fadeD = fadeDerivative(Pf.xy) as V;
-  const nx0 = mix(n00, n10, fadeXY.x) as V;
-  const nx1 = mix(n01, n11, fadeXY.x) as V;
+  const nx0 = mix(n.x, n.y, fadeXY.x) as V;
+  const nx1 = mix(n.z, n.w, fadeXY.x) as V;
   const value = mix(nx0, nx1, fadeXY.y).mul(2.3) as V;
-  const dx0 = mix(g00.x, g10.x, fadeXY.x).add(n10.sub(n00).mul(fadeD.x)) as V;
-  const dx1 = mix(g01.x, g11.x, fadeXY.x).add(n11.sub(n01).mul(fadeD.x)) as V;
+  const dx0 = mix(gxn.x, gxn.y, fadeXY.x).add(n.y.sub(n.x).mul(fadeD.x)) as V;
+  const dx1 = mix(gxn.z, gxn.w, fadeXY.x).add(n.w.sub(n.z).mul(fadeD.x)) as V;
   const derivativeX = mix(dx0, dx1, fadeXY.y).mul(2.3) as V;
-  const dy0 = mix(g00.y, g10.y, fadeXY.x) as V;
-  const dy1 = mix(g01.y, g11.y, fadeXY.x) as V;
+  const dy0 = mix(gyn.x, gyn.y, fadeXY.x) as V;
+  const dy1 = mix(gyn.z, gyn.w, fadeXY.x) as V;
   const derivativeY = mix(dy0, dy1, fadeXY.y).add(nx1.sub(nx0).mul(fadeD.y)).mul(2.3) as V;
   return vec3(value, derivativeX, derivativeY);
 }).setLayout({
