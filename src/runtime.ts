@@ -10,6 +10,7 @@ import { defaultRegistry, type NodeRegistry } from "./graph/registry";
 import { BakeTextureCache } from "./cache/bake-cache";
 import type { BakeCacheEntryMeta, BakeCacheMetrics, BakeCacheOptions } from "./cache/types";
 import type { BakeCacheKey } from "./cache/key";
+import type { ShaderVariant } from "./graph/shader-variant";
 
 // Cache-hydrated channel textures. Satisfies ChannelTextures so it drops straight into buildMeshMaterial, and
 // adds the height map (not a lit channel, so not part of that interface) plus the disposal the caller owns.
@@ -25,9 +26,8 @@ export interface MaterialGraphRuntimeOptions {
   registry?: NodeRegistry;
   bakeService?: MaterialBakeService;
   source?: string;
-  // Benchmark/diagnostic only. A different value changes the actual WGSL identity for bake and visible
-  // surface shaders without changing their output, defeating cross-reload shader/pipeline cache hits.
-  shaderCacheNonce?: string;
+  // Optional shader decoration supplied by an extension entry. The default runtime installs none.
+  shaderVariant?: ShaderVariant;
   // Cross-session baked-texture cache. OPT-IN: omit it (or pass false) and nothing is persisted and no
   // storage is touched. Pass options to get the built-in IndexedDB store, or a BakeTextureCache you built
   // around your own BakeCacheStore.
@@ -50,7 +50,7 @@ export class MaterialGraphRuntime {
       this.graph,
       this.service,
       options.source,
-      options.shaderCacheNonce,
+      options.shaderVariant,
     );
     if (options.cache instanceof BakeTextureCache) {
       this.service.setCache(options.cache);

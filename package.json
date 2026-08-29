@@ -35,6 +35,10 @@
     ".": {
       "types": "./dist/index.d.ts",
       "import": "./dist/index.js"
+    },
+    "./profiling": {
+      "types": "./dist/profiling/index.d.ts",
+      "import": "./dist/profiling.js"
     }
   },
   "files": [

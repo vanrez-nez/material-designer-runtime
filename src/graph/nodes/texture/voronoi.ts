@@ -1,5 +1,5 @@
 import { int, float, floor, max, smoothstep } from "three/tsl";
-import type { MaterialNodeDef, MaterialValue, NodeProfileWorkloadStage, PortDef } from "../../types";
+import type { MaterialNodeDef, MaterialValue, PortDef } from "../../types";
 import {
   blenderVoronoiF1,
   blenderVoronoiF1Color,
@@ -39,48 +39,6 @@ const EDGE_OUTPUTS: PortDef[] = [
   { key: "random", label: "Random", kind: "float" },
 ];
 const COORD_INPUT: PortDef[] = [{ key: "coord", kind: "vector" }];
-
-function voronoiWorkload(params: Record<string, unknown>, outputKey: string) {
-  const feature = (params.feature as string) ?? "f1";
-  const relax = Math.max(0, Math.round(Number(params.relax ?? 0)));
-  const stage = (name: string, iterations: number, primitive: string) => ({
-    name,
-    iterations,
-    primitive,
-    primitiveEvaluations: iterations,
-  });
-  let kernel = feature;
-  let stages: NodeProfileWorkloadStage[];
-
-  if (feature === "distance-to-edge-2d") {
-    kernel = "distance-to-edge-2d";
-    stages =
-      outputKey === "random"
-        ? [stage("nearest 2d feature", 9, "pcg-cell-hash")]
-        : [stage("nearest 2d feature", 9, "pcg-cell-hash"), stage("nearest 2d edge", 9, "pcg-cell-hash")];
-  } else if (feature === "distance-to-edge" && relax > 0) {
-    kernel = "relaxed-distance-to-edge-2d";
-    stages =
-      outputKey === "random"
-        ? [stage("nearest seed", 9, "uniform-seed-lookup"), stage("winning cell value", 1, "uniform-value-lookup")]
-        : [stage("nearest seed", 9, "uniform-seed-lookup"), stage("nearest edge", 9, "uniform-seed-lookup")];
-  } else if (feature === "distance-to-edge") {
-    kernel = "blender-distance-to-edge-3d";
-    stages =
-      outputKey === "random"
-        ? [stage("nearest cell for random", 27, "pcg-cell-hash")]
-        : [stage("nearest feature", 27, "pcg-cell-hash"), stage("nearest edge", 27, "pcg-cell-hash")];
-  } else {
-    stages = [stage(`${feature} neighborhood`, 27, "pcg-cell-hash")];
-  }
-
-  return {
-    kernel,
-    scope: "raw-isolated-node" as const,
-    stages,
-    totalPrimitiveEvaluations: stages.reduce((total, item) => total + item.primitiveEvaluations, 0),
-  };
-}
 
 // Deterministic per-cell random in [0,1] (stable across bakes). Indexed by the cell's linear id; the array
 // IS the tile period, so wrapped lookups repeat seamlessly across the bake-tile edge.
@@ -153,9 +111,6 @@ export const voronoiNode: MaterialNodeDef = {
           ? { ...p, bakeStructural: true }
           : p,
       );
-  },
-  profileWorkload(params, outputKey) {
-    return voronoiWorkload(params, outputKey);
   },
   build(ctx) {
     // Param contract (see memory: node-param-contract): metric/feature/relax are build-time selects/ints

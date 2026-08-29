@@ -12,7 +12,7 @@ import {
 } from "three";
 import { vec3, vec2, sRGBTransferOETF, texture, uv, normalize } from "three/tsl";
 import type { MaterialValue, PbrSocket } from "./types";
-import { createShaderCacheBuster } from "./shader-cache-bust";
+import type { ShaderVariant } from "./shader-variant";
 
 // Colour-management convention (plan L5 / Phase 6): the graph works in LINEAR space, and a baked texture
 // follows texture convention — colour channels are sRGB-encoded (display), data channels stay linear.
@@ -87,10 +87,8 @@ export function ssPoolInfo(): string[] {
   return [...ssPool.keys()];
 }
 
-function ssTargetsFor(w: number, h: number, shaderCacheNonce?: string): SsTargets {
-  // Benchmark runs include their nonce in the pool key and the actual downsample WGSL. Normal consumers omit
-  // it and retain the original one-pool-per-size reuse behavior.
-  const key = shaderCacheNonce ? `${w}x${h}|${shaderCacheNonce}` : `${w}x${h}`;
+function ssTargetsFor(w: number, h: number, shaderVariant?: ShaderVariant): SsTargets {
+  const key = shaderVariant ? `${w}x${h}|${shaderVariant.key}` : `${w}x${h}`;
   const existing = ssPool.get(key);
   if (existing) return existing;
   // Color-only supersample intermediate — no depth test — so skip the (default) depth/stencil attachment.
@@ -99,11 +97,10 @@ function ssTargetsFor(w: number, h: number, shaderCacheNonce?: string): SsTarget
   ssRT.texture.minFilter = ssRT.texture.magFilter = NearestFilter;
   ssRT.texture.wrapS = ssRT.texture.wrapT = RepeatWrapping; // box taps at tile edges wrap, not clamp
   const ssTexel = vec2(1 / w, 1 / h); // constant for this size
-  const shaderCacheBuster = createShaderCacheBuster(shaderCacheNonce);
   const mkDown = (isNormal: boolean): QuadMesh => {
     const mat = new MeshBasicNodeMaterial();
     const colorNode = downsampleNode(ssRT.texture, ssTexel, isNormal);
-    mat.colorNode = shaderCacheBuster?.vec3(colorNode) ?? colorNode;
+    mat.colorNode = shaderVariant?.vec3(colorNode) ?? colorNode;
     return new QuadMesh(mat);
   };
   const targets: SsTargets = { ssRT, downColorQuad: mkDown(false), downNormalQuad: mkDown(true) };
@@ -147,53 +144,6 @@ const compileScene = new Scene();
 const compileCamera = new OrthographicCamera(-1, 1, 1, -1, 0, 1);
 const compileQuads: QuadMesh[] = [];
 
-function prepareSingleCompile(material: MeshBasicNodeMaterial): QuadMesh {
-  if (!compileQuads[0]) compileQuads.push(new QuadMesh());
-  compileScene.clear();
-  compileQuads[0].material = material;
-  compileScene.add(compileQuads[0]);
-  return compileQuads[0];
-}
-
-// Compile one fullscreen material against the exact target it will profile into. Unlike a first draw this
-// isolates Three/WGSL/pipeline wall time from GPU execution; timestamp-query measures the latter separately.
-export async function compileMaterialAsync(
-  renderer: WebGPURenderer,
-  material: MeshBasicNodeMaterial,
-  target: RenderTarget,
-): Promise<void> {
-  prepareSingleCompile(material);
-  const previous = renderer.getRenderTarget();
-  renderer.setRenderTarget(target);
-  try {
-    await renderer.compileAsync(compileScene, compileCamera);
-  } finally {
-    renderer.setRenderTarget(previous);
-  }
-}
-
-// Inspect the native shader for an already-timed material. Renderer.debug.getShaderAsync internally calls
-// compileAsync again, so the profiler deliberately invokes this only AFTER its cold compile samples. The
-// pipeline is warm at that point and shader extraction cannot contaminate the recorded compile duration.
-export async function inspectMaterialShaderAsync(
-  renderer: WebGPURenderer,
-  material: MeshBasicNodeMaterial,
-  target: RenderTarget,
-): Promise<{ fragmentShader: string; vertexShader: string }> {
-  const quad = prepareSingleCompile(material);
-  const previous = renderer.getRenderTarget();
-  renderer.setRenderTarget(target);
-  try {
-    const shader = await renderer.debug.getShaderAsync(compileScene, compileCamera, quad);
-    return {
-      fragmentShader: shader.fragmentShader ?? "",
-      vertexShader: shader.vertexShader ?? "",
-    };
-  } finally {
-    renderer.setRenderTarget(previous);
-  }
-}
-
 // Pre-compile every channel's render pipeline OFF the blocking path. The normal render path
 // (`bakeQuad.render`) hits three's synchronous `device.createRenderPipeline`, which on Dawn/Metal defers
 // the heavy shader compile to submit time and pegs the GPU process — a single structural edit on a heavy
@@ -206,7 +156,7 @@ export async function compileMaterialsAsync(
   renderer: WebGPURenderer,
   materials: MeshBasicNodeMaterial[],
   destSize: number,
-  shaderCacheNonce?: string,
+  shaderVariant?: ShaderVariant,
 ): Promise<void> {
   while (compileQuads.length < materials.length) compileQuads.push(new QuadMesh());
   compileScene.clear();
@@ -216,7 +166,7 @@ export async function compileMaterialsAsync(
   }
   const previous = renderer.getRenderTarget();
   // Compile against the supersample target the channels actually render into (format-matched pipeline).
-  renderer.setRenderTarget(ssTargetsFor(destSize * SS, destSize * SS, shaderCacheNonce).ssRT);
+  renderer.setRenderTarget(ssTargetsFor(destSize * SS, destSize * SS, shaderVariant).ssRT);
   try {
     await renderer.compileAsync(compileScene, compileCamera);
   } finally {
@@ -247,7 +197,7 @@ export function renderMaterialToTarget(
   material: MeshBasicNodeMaterial,
   rt: RenderTarget,
   isNormal = false,
-  shaderCacheNonce?: string,
+  shaderVariant?: ShaderVariant,
 ): void {
   // Pick (or lazily create) the persistent supersample target for this destination size — never resize a
   // shared one (see ssTargetsFor). Same-size renders reuse the same GPU textures, so nothing is created or
@@ -255,7 +205,7 @@ export function renderMaterialToTarget(
   const { ssRT, downColorQuad, downNormalQuad } = ssTargetsFor(
     rt.width * SS,
     rt.height * SS,
-    shaderCacheNonce,
+    shaderVariant,
   );
   bakeQuad.material = material;
   const previous = renderer.getRenderTarget();

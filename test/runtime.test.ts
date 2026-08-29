@@ -15,14 +15,14 @@ import {
   type MaterialType,
 } from "../src";
 import { createBakeTimingBreakdown } from "../src/graph/bake-service";
-import { createShaderCacheBuster } from "../src/graph/shader-cache-bust";
 import {
+  createShaderCacheBuster,
   deriveMeasuredNodeCosts,
   measureNodeShaderMetrics,
   profilableNodeOutputs,
   profileWorkload,
   type NodeProfileRow,
-} from "../src/graph/node-profiler";
+} from "../src/profiling";
 import { vec3 } from "three/tsl";
 import {
   MeshStandardNodeMaterial,
@@ -225,17 +225,17 @@ describe("node profile measurement", () => {
     };
     const output = { key: "field", kind: "float" as const };
 
-    expect(profileWorkload(stone, output, defaultRegistry)).toMatchObject({
+    expect(profileWorkload(stone, output)).toMatchObject({
       kernel: "stone",
       configuredTileSize: 512,
       totalPrimitiveEvaluations: 30,
     });
-    expect(profileWorkload(value, output, defaultRegistry)).toMatchObject({
+    expect(profileWorkload(value, output)).toMatchObject({
       kernel: "value",
       totalPrimitiveEvaluations: 24,
     });
     stone.params.preset = "stone-analytic";
-    expect(profileWorkload(stone, output, defaultRegistry)).toMatchObject({
+    expect(profileWorkload(stone, output)).toMatchObject({
       kernel: "stone-analytic",
       totalPrimitiveEvaluations: 12,
     });
@@ -248,18 +248,18 @@ describe("node profile measurement", () => {
       params: { feature: "distance-to-edge", relax: 0 },
       enabled: true,
     };
-    expect(profileWorkload(node, { key: "distance", kind: "float" }, defaultRegistry)?.totalPrimitiveEvaluations).toBe(54);
-    expect(profileWorkload(node, { key: "random", kind: "float" }, defaultRegistry)?.totalPrimitiveEvaluations).toBe(27);
+    expect(profileWorkload(node, { key: "distance", kind: "float" })?.totalPrimitiveEvaluations).toBe(54);
+    expect(profileWorkload(node, { key: "random", kind: "float" })?.totalPrimitiveEvaluations).toBe(27);
     node.params.relax = 3;
-    expect(profileWorkload(node, { key: "edges", kind: "float" }, defaultRegistry)?.totalPrimitiveEvaluations).toBe(18);
-    expect(profileWorkload(node, { key: "random", kind: "float" }, defaultRegistry)?.totalPrimitiveEvaluations).toBe(10);
+    expect(profileWorkload(node, { key: "edges", kind: "float" })?.totalPrimitiveEvaluations).toBe(18);
+    expect(profileWorkload(node, { key: "random", kind: "float" })?.totalPrimitiveEvaluations).toBe(10);
     node.params.feature = "distance-to-edge-2d";
     node.params.relax = 0;
-    expect(profileWorkload(node, { key: "edges", kind: "float" }, defaultRegistry)).toMatchObject({
+    expect(profileWorkload(node, { key: "edges", kind: "float" })).toMatchObject({
       kernel: "distance-to-edge-2d",
       totalPrimitiveEvaluations: 18,
     });
-    expect(profileWorkload(node, { key: "random", kind: "float" }, defaultRegistry)?.totalPrimitiveEvaluations).toBe(9);
+    expect(profileWorkload(node, { key: "random", kind: "float" })?.totalPrimitiveEvaluations).toBe(9);
   });
 
   it("measures isolated WGSL growth against its matched baseline", () => {

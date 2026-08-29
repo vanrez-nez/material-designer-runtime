@@ -95,14 +95,12 @@ export interface CompileOptions {
   // baseColor (flat: roughness 1, metallic 0, no normal/height). Ignored if the id isn't found or its
   // first output is a shader closure.
   soloNodeId?: string;
-  // Select a specific output for solo/profiling. Normal editor solo keeps its existing first-output default.
+  // Select a specific solo output. Normal editor solo keeps its existing first-output default.
   soloOutputKey?: string;
-  // Profiling-only counterfactuals. `isolateSoloNodeInputs` replaces connected upstream expressions with
-  // cheap, varying, type-correct values so the pipeline contains this node's code but not its ancestors.
-  // `soloDependencyBaseline` then replaces the node output with a minimal expression over those same inputs;
-  // real-minus-baseline is the measured node-local cost reported by MaterialBakeService.profileNodes().
-  isolateSoloNodeInputs?: boolean;
-  soloDependencyBaseline?: boolean;
+  // Optional compile transforms for tooling that needs a controlled graph variant. The runtime never installs
+  // these itself; callers own both the transform implementation and its semantics.
+  transformNodeInputs?: (ctx: CompileNodeInputsContext) => Record<string, MaterialValue | undefined>;
+  transformNodeOutputs?: (ctx: CompileNodeOutputsContext) => Record<string, MaterialValue>;
   // Offline decomposition: when provided, each group's outputs are baked to intermediate textures (via this
   // provider) and replaced downstream by a texture sample — so no single channel shader inlines the whole
   // graph (which overflows WebKit's 8192-byte private-var limit / freezes Firefox's sync compiler).
@@ -116,13 +114,21 @@ export interface CompileOptions {
   outputResolution?: number;
 }
 
+export interface CompileNodeInputsContext {
+  node: GraphNode;
+  ports: { inputs: PortDef[]; outputs: PortDef[] };
+  inputs: Record<string, MaterialValue | undefined>;
+}
+
+export interface CompileNodeOutputsContext extends CompileNodeInputsContext {
+  outputs: Record<string, MaterialValue>;
+}
+
 // Mutable holder threaded through the recursive compile so a soloed node at any nesting depth can have its
 // first-output value captured. `kind` drives the coercion to colour for the preview bundle.
 interface SoloCapture {
   id: string;
   outputKey?: string;
-  isolateInputs: boolean;
-  dependencyBaseline: boolean;
   value?: MaterialValue;
   kind?: PortKind;
 }
@@ -447,8 +453,6 @@ export function compileSockets(
     ? {
         id: opts.soloNodeId,
         outputKey: opts.soloOutputKey,
-        isolateInputs: opts.isolateSoloNodeInputs === true,
-        dependencyBaseline: opts.soloDependencyBaseline === true,
       }
     : undefined;
   const cachePlan: CacheEntry[] = [];
@@ -470,48 +474,6 @@ export function compileSockets(
 function soloBundle(value: MaterialValue, kind: PortKind): MaterialBundle {
   const baseColor = kind === "float" ? vec3(value) : value; // vector/color are already vec3
   return { baseColor, roughness: float(1), metallic: float(0) };
-}
-
-// Cheap varying stand-ins used by the node-local profiler. Values differ per socket so an optimizer cannot
-// collapse a blend because both sides happen to be identical; they contain no upstream procedural work.
-function isolatedProfileInput(kind: PortKind, index: number): MaterialValue | undefined {
-  if (kind === "shader") return undefined;
-  const u = uv();
-  const a = u.x.mul(0.31 + index * 0.07).add(u.y.mul(0.17 + index * 0.05));
-  if (kind === "float") return a;
-  return vec3(a, u.y.mul(0.43 + index * 0.03).add(u.x.mul(0.11)), u.x.mul(u.y).add(index * 0.013));
-}
-
-function isolateProfileInputs(
-  ports: PortDef[],
-  inputs: Record<string, MaterialValue | undefined>,
-): Record<string, MaterialValue | undefined> {
-  const isolated = { ...inputs };
-  let index = 0;
-  for (const port of ports) {
-    if (inputs[port.key] !== undefined) isolated[port.key] = isolatedProfileInput(port.kind, index++);
-  }
-  return isolated;
-}
-
-// Minimal fan-in over the same isolated inputs. It is deliberately not a constant pass: subtracting this
-// measured pipeline removes the solo wrapper and input plumbing while retaining the dependency shape.
-function profileDependencyBaseline(
-  ports: PortDef[],
-  inputs: Record<string, MaterialValue | undefined>,
-  outputKind: PortKind,
-): MaterialValue {
-  let value: MaterialValue = float(0.5);
-  let connected = 0;
-  for (const port of ports) {
-    const input = inputs[port.key];
-    if (input === undefined || port.kind === "shader") continue;
-    const scalar = port.kind === "float" ? input : input.x;
-    value = connected === 0 ? scalar : value.add(scalar.mul(0.001 * (connected + 1)));
-    connected += 1;
-  }
-  if (outputKind === "float") return value;
-  return vec3(value);
 }
 
 interface CompiledDocument {
@@ -565,7 +527,9 @@ function compileDocument(
 
     let inputs = resolveInputs(node, doc, outputsByNode, byId, registry);
     const def = registry.get(node.type);
-    if (solo?.id === id && solo.isolateInputs) inputs = isolateProfileInputs(ports.inputs, inputs);
+    if (opts.transformNodeInputs) {
+      inputs = opts.transformNodeInputs({ node, ports, inputs });
+    }
     const uniforms = buildUniforms(def, node);
     uniformsByNode.set(id, uniforms);
     // Offline tiling: the node builds `period / tileRepeat` periods so its feature size survives the ×repeat
@@ -573,15 +537,16 @@ function compileDocument(
     const tileRepeat = tileRepeatFor(node, def, opts);
     const ctx = makeBuildCtx(id, node, def, inputs, uniforms, coord, opts, tileRepeat, usageByNode);
     const built = def.build(ctx);
-    const nodeOutputs = maybeTileNode(node, def, built, opts, cachePlan, tileRepeat) ?? built;
+    let nodeOutputs = maybeTileNode(node, def, built, opts, cachePlan, tileRepeat) ?? built;
+    if (opts.transformNodeOutputs) {
+      nodeOutputs = opts.transformNodeOutputs({ node, ports, inputs, outputs: nodeOutputs });
+    }
     outputsByNode.set(id, nodeOutputs);
 
     if (solo?.id === id && solo.value === undefined) {
       const output = ports.outputs.find((port) => port.key === solo.outputKey) ?? ports.outputs[0];
       if (output) {
-        solo.value = solo.dependencyBaseline
-          ? profileDependencyBaseline(ports.inputs, inputs, output.kind)
-          : nodeOutputs[output.key];
+        solo.value = nodeOutputs[output.key];
         solo.kind = output.kind;
       }
     }

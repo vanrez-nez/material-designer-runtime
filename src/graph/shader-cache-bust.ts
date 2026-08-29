@@ -1,15 +1,12 @@
 import { uniform, wgslFn } from "three/tsl";
-import type { MaterialValue } from "./types";
+import type { ShaderVariant } from "./shader-variant";
 
 // A benchmark-only shader identity. Three caches programs by their generated shader source and Chromium's
 // GPU process can retain compiled shader/pipeline data across a page reload. Routing a value through one of
 // these identity functions changes the actual WGSL for every benchmark run without changing its pixels.
 //
 // This is intentionally opt-in. Normal editor/runtime consumers should keep shader reuse enabled.
-export interface ShaderCacheBuster {
-  scalar(value: MaterialValue): MaterialValue;
-  vec3(value: MaterialValue): MaterialValue;
-}
+export type ShaderCacheBuster = ShaderVariant;
 
 function wgslIdentifier(value: string): string {
   const normalized = value.replace(/[^a-zA-Z0-9_]/g, "_").slice(0, 96);
@@ -44,6 +41,7 @@ export function createShaderCacheBuster(nonce?: string): ShaderCacheBuster | nul
   `);
 
   return {
+    key: nonce,
     scalar: (value) => scalarIdentity({ value, guard: zeroGuard }),
     vec3: (value) => vec3Identity({ value, guard: zeroGuard }),
   };

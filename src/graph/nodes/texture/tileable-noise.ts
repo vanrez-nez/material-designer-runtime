@@ -1,5 +1,5 @@
 import { vec2, float, floor, max, mod } from "three/tsl";
-import type { MaterialNodeDef, MaterialValue, NodeProfileWorkloadStage } from "../../types";
+import type { MaterialNodeDef, MaterialValue } from "../../types";
 import { tileableFbm } from "../../../tsl/tileable-noise";
 import { blenderFbm } from "../../../tsl/blender-noise";
 import {
@@ -21,70 +21,6 @@ import {
 } from "../../../tsl/noise";
 
 type V = MaterialValue;
-
-function tileableNoiseWorkload(params: Record<string, unknown>) {
-  const noiseType = (params.noiseType as string) ?? "perlin-fbm";
-  const preset = (params.preset as string) ?? "none";
-  const effective = noiseType === "perlin-fbm" && preset !== "none" ? preset : noiseType;
-  const octaves = Math.max(1, Math.min(8, Math.round(Number(params.octaves ?? 4))));
-  const rawTile = params.tileSize;
-  const configuredTileSize =
-    typeof rawTile === "string" && rawTile !== "off" && Number.isFinite(Number(rawTile))
-      ? Number(rawTile)
-      : undefined;
-  const stage = (name: string, iterations: number, primitive: string, perIteration: number) => ({
-    name,
-    iterations,
-    primitive,
-    primitiveEvaluations: iterations * perIteration,
-  });
-
-  let stages: NodeProfileWorkloadStage[];
-  switch (effective) {
-    case "curl":
-      stages = [stage("finite-difference curl", 1, "periodic-perlin", 4)];
-      break;
-    case "paper":
-    case "wool":
-      stages = [stage(`${effective} fBm`, octaves, "periodic-perlin", 4)];
-      break;
-    case "stone":
-    case "erosion":
-      stages = [stage(`${effective} fBm`, octaves, "periodic-perlin", 5)];
-      break;
-    case "stone-analytic":
-    case "erosion-analytic":
-      stages = [stage(`${effective} fBm`, octaves, "periodic-perlin", 2)];
-      break;
-    case "value":
-      stages = [stage("value fBm", octaves, "pcg-cell-hash", 4)];
-      break;
-    case "worley":
-    case "voronoi-smooth":
-      stages = [stage(`${effective} fBm`, octaves, "pcg-cell-hash", 9)];
-      break;
-    case "simplex":
-      stages = [stage("simplex fBm", octaves, "simplex-corner", 3)];
-      break;
-    case "wavelet":
-      stages = [stage("wavelet fBm", octaves, "pcg-cell-hash", 1)];
-      break;
-    case "gabor":
-      stages = [stage("3x3 cells x 8 impulses", 72, "pcg-cell-hash", 2)];
-      break;
-    default:
-      stages = [stage("perlin fBm", octaves, "periodic-perlin", 1)];
-      break;
-  }
-
-  return {
-    kernel: effective,
-    scope: "raw-isolated-node" as const,
-    ...(configuredTileSize ? { configuredTileSize } : {}),
-    stages,
-    totalPrimitiveEvaluations: stages.reduce((total, item) => total + item.primitiveEvaluations, 0),
-  };
-}
 
 // The genuine, irreducible noise ALGORITHMS selectable on this node — each a distinct generative primitive.
 // "perlin-fbm" is the DEFAULT and reproduces the original Tileable Noise output verbatim. The rest are
@@ -230,9 +166,6 @@ export const tileableNoiseNode: MaterialNodeDef = {
     const show = new Set(["noiseType", "scale", ...caps]);
     if (noiseType === "perlin-fbm") show.add("preset"); // preset selector only under Perlin
     return tileableNoiseNode.params.filter((p) => show.has(p.key));
-  },
-  profileWorkload(params) {
-    return tileableNoiseWorkload(params);
   },
   build(ctx) {
     const coord = (ctx.inputs.coord ?? ctx.coord) as V;

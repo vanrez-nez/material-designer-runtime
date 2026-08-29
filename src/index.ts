@@ -24,12 +24,6 @@ export {
   type BakeTimingBreakdown,
 } from "./graph/bake-service";
 export {
-  type NodeProfileOptions,
-  type NodeProfileReport,
-  type NodeProfileRow,
-  type NodeProfileShaderMetrics,
-} from "./graph/node-profiler";
-export {
   compileGraph,
   compileSockets,
   countGraphNodes,
@@ -61,5 +55,6 @@ export {
   nodePorts,
 } from "./graph/registry";
 export { TexturedSurface } from "./graph/textured-surface";
+export type { ShaderVariant } from "./graph/shader-variant";
 export { runTilingTest } from "./graph/tiling-test";
 export * from "./graph/types";

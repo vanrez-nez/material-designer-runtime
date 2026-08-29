@@ -4,13 +4,12 @@ import {
   GROUP_TYPE,
   type MaterialGraphDocument,
   type GraphNode,
-  type NodeProfileWorkload,
   type PortDef,
 } from "./types";
 import { nodePorts, type NodeRegistry } from "./registry";
 
-// Per-node cost profiling — the pure (GPU-free) half. The measuring loop lives on MaterialBakeService
-// (`profileNodes`) because it needs the private serial queue, renderer, and GPU back-pressure.
+// Per-node cost profiling — the pure (GPU-free) half. The measuring loop lives in the opt-in profiling
+// entry and reaches the shared renderer only through MaterialBakeService.runRendererTask().
 //
 // Each output gets two controlled node-only pipelines: the real node with cheap varying stand-ins for every
 // connected input, and a minimal dependency baseline over those same stand-ins. Their measured difference is
@@ -35,6 +34,21 @@ export interface NodeProfileShaderMetrics {
   isolatedLoopCount: number;
   baselineLoopCount: number;
   loopCountDelta: number;
+}
+
+export interface NodeProfileWorkloadStage {
+  name: string;
+  iterations: number;
+  primitive: string;
+  primitiveEvaluations: number;
+}
+
+export interface NodeProfileWorkload {
+  kernel: string;
+  scope: "raw-isolated-node";
+  configuredTileSize?: number;
+  stages: NodeProfileWorkloadStage[];
+  totalPrimitiveEvaluations: number;
 }
 
 function shaderSourceStats(source: string): {
@@ -168,11 +182,124 @@ export function profilableNodeOutputs(
 export function profileWorkload(
   node: GraphNode,
   output: PortDef,
-  registry: NodeRegistry,
 ): NodeProfileWorkload | undefined {
-  return registry.has(node.type)
-    ? registry.get(node.type).profileWorkload?.(node.params, output.key, "offline")
-    : undefined;
+  if (node.type === "tileable-noise") return tileableNoiseWorkload(node.params);
+  if (node.type === "voronoi") return voronoiWorkload(node.params, output.key);
+  return undefined;
+}
+
+function tileableNoiseWorkload(params: Record<string, unknown>): NodeProfileWorkload {
+  const noiseType = (params.noiseType as string) ?? "perlin-fbm";
+  const preset = (params.preset as string) ?? "none";
+  const effective = noiseType === "perlin-fbm" && preset !== "none" ? preset : noiseType;
+  const octaves = Math.max(1, Math.min(8, Math.round(Number(params.octaves ?? 4))));
+  const rawTile = params.tileSize;
+  const configuredTileSize =
+    typeof rawTile === "string" && rawTile !== "off" && Number.isFinite(Number(rawTile))
+      ? Number(rawTile)
+      : undefined;
+  const stage = (
+    name: string,
+    iterations: number,
+    primitive: string,
+    perIteration: number,
+  ): NodeProfileWorkloadStage => ({
+    name,
+    iterations,
+    primitive,
+    primitiveEvaluations: iterations * perIteration,
+  });
+
+  let stages: NodeProfileWorkloadStage[];
+  switch (effective) {
+    case "curl":
+      stages = [stage("finite-difference curl", 1, "periodic-perlin", 4)];
+      break;
+    case "paper":
+    case "wool":
+      stages = [stage(`${effective} fBm`, octaves, "periodic-perlin", 4)];
+      break;
+    case "stone":
+    case "erosion":
+      stages = [stage(`${effective} fBm`, octaves, "periodic-perlin", 5)];
+      break;
+    case "stone-analytic":
+    case "erosion-analytic":
+      stages = [stage(`${effective} fBm`, octaves, "periodic-perlin", 2)];
+      break;
+    case "value":
+      stages = [stage("value fBm", octaves, "pcg-cell-hash", 4)];
+      break;
+    case "worley":
+    case "voronoi-smooth":
+      stages = [stage(`${effective} fBm`, octaves, "pcg-cell-hash", 9)];
+      break;
+    case "simplex":
+      stages = [stage("simplex fBm", octaves, "simplex-corner", 3)];
+      break;
+    case "wavelet":
+      stages = [stage("wavelet fBm", octaves, "pcg-cell-hash", 1)];
+      break;
+    case "gabor":
+      stages = [stage("3x3 cells x 8 impulses", 72, "pcg-cell-hash", 2)];
+      break;
+    default:
+      stages = [stage("perlin fBm", octaves, "periodic-perlin", 1)];
+      break;
+  }
+
+  return {
+    kernel: effective,
+    scope: "raw-isolated-node",
+    ...(configuredTileSize ? { configuredTileSize } : {}),
+    stages,
+    totalPrimitiveEvaluations: stages.reduce((total, item) => total + item.primitiveEvaluations, 0),
+  };
+}
+
+function voronoiWorkload(
+  params: Record<string, unknown>,
+  outputKey: string,
+): NodeProfileWorkload {
+  const feature = (params.feature as string) ?? "f1";
+  const relax = Math.max(0, Math.round(Number(params.relax ?? 0)));
+  const stage = (name: string, iterations: number, primitive: string): NodeProfileWorkloadStage => ({
+    name,
+    iterations,
+    primitive,
+    primitiveEvaluations: iterations,
+  });
+  let kernel = feature;
+  let stages: NodeProfileWorkloadStage[];
+
+  if (feature === "distance-to-edge-2d") {
+    kernel = "distance-to-edge-2d";
+    stages =
+      outputKey === "random"
+        ? [stage("nearest 2d feature", 9, "pcg-cell-hash")]
+        : [stage("nearest 2d feature", 9, "pcg-cell-hash"), stage("nearest 2d edge", 9, "pcg-cell-hash")];
+  } else if (feature === "distance-to-edge" && relax > 0) {
+    kernel = "relaxed-distance-to-edge-2d";
+    stages =
+      outputKey === "random"
+        ? [stage("nearest seed", 9, "uniform-seed-lookup"), stage("winning cell value", 1, "uniform-value-lookup")]
+        : [stage("nearest seed", 9, "uniform-seed-lookup"), stage("nearest edge", 9, "uniform-seed-lookup")];
+  } else if (feature === "distance-to-edge") {
+    kernel = "blender-distance-to-edge-3d";
+    stages =
+      outputKey === "random"
+        ? [stage("nearest cell for random", 27, "pcg-cell-hash")]
+        : [stage("nearest feature", 27, "pcg-cell-hash"), stage("nearest edge", 27, "pcg-cell-hash")];
+  } else {
+    stages = [stage(`${feature} neighborhood`, 27, "pcg-cell-hash")];
+  }
+
+  return {
+    kernel,
+    scope: "raw-isolated-node",
+    stages,
+    totalPrimitiveEvaluations: stages.reduce((total, item) => total + item.primitiveEvaluations, 0),
+  };
 }
 
 function nodePortsForProfile(node: GraphNode, registry: NodeRegistry): PortDef[] {

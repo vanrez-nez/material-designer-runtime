@@ -103,6 +103,23 @@ for PNG export, use `bakeService.readImage(session, channel, 1024)` → `ImageDa
 multiple of 64). If you keep a live `MaterialGraphRuntime`, the same baked textures are also
 reachable via `runtime.surface.getChannelTexture(channel)` and `runtime.surface.getHeightTexture()`.
 
+## Opt-in profiling
+
+Profiling is a separate package entry and is not reachable from the production runtime bundle. Import it
+only in a benchmark or development surface:
+
+```ts
+import { MaterialBakeService } from "material-designer-runtime";
+import { profileMaterialNodes } from "material-designer-runtime/profiling";
+
+const service = new MaterialBakeService();
+service.attachRenderer(renderer);
+const report = await profileMaterialNodes(service, session, { size: 512, runs: 5 });
+```
+
+The `/profiling` entry owns timestamp queries, shader inspection, workload accounting, matched-baseline
+compiles, and cold shader identities. None of those modules are imported by `material-designer-runtime`.
+
 ## Persistent texture cache (opt-in)
 
 Baking is dominated by **shader compilation**, not rendering — on a heavy graph the pipeline compile runs

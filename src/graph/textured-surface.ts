@@ -18,7 +18,7 @@ import {
   type PbrSocket,
 } from "./types";
 import { SURFACE_CHANNELS, type MaterialBakeService, type BakedTextureSet } from "./bake-service";
-import { createShaderCacheBuster, type ShaderCacheBuster } from "./shader-cache-bust";
+import type { ShaderVariant } from "./shader-variant";
 
 // Parallax-occlusion march steps (LINEAR cost, paid per preview fragment — the dominant GPU cost of the
 // effect). 12 is the perf/quality balance.
@@ -86,17 +86,17 @@ export class TexturedSurface {
   // during a rebuild submits a texture being resized/recreated ("Destroyed texture used in a submit").
   private processingDepth = 0;
   private idleWaiters: Array<() => void> = [];
-  private readonly shaderCacheBuster: ShaderCacheBuster | null;
+  private readonly shaderVariant: ShaderVariant | undefined;
 
   constructor(
     private readonly graph: MaterialGraphSource,
     private readonly service: MaterialBakeService,
     // Identifies this surface in bake telemetry so UI can scope its progress.
     private readonly source?: string,
-    // Benchmark-only identity forwarded to every bake shader and the final visible surface shader.
-    private readonly shaderCacheNonce?: string,
+    // Optional shader decoration forwarded to bake and visible-surface shaders.
+    shaderVariant?: ShaderVariant,
   ) {
-    this.shaderCacheBuster = createShaderCacheBuster(shaderCacheNonce);
+    this.shaderVariant = shaderVariant;
     this.set = service.createTextureSet(SURFACE_CHANNELS, this.surfaceBakeSize());
     // Startup fallback: no renderer yet → procedural live material so the surface is valid; the first
     // refresh() (after the service gets a renderer) switches to the baked offline surface.
@@ -414,7 +414,7 @@ export class TexturedSurface {
           label: "surface",
           source: this.source,
           bypassCache,
-          shaderCacheNonce: this.shaderCacheNonce,
+          shaderVariant: this.shaderVariant,
         });
         this.lastBakeMs = performance.now() - t0;
         if (changed || !this.wiredOnce || familyChanged) {
@@ -481,8 +481,8 @@ export class TexturedSurface {
         ? triplanarColor(this.set.texture(ch)!, scale, sharp)
         : sampleUv(this.set.texture(ch)!);
     const coldScalar = (value: MaterialValue): MaterialValue =>
-      this.shaderCacheBuster?.scalar(value) ?? value;
-    const coldVec3 = (value: MaterialValue): MaterialValue => this.shaderCacheBuster?.vec3(value) ?? value;
+      this.shaderVariant?.scalar(value) ?? value;
+    const coldVec3 = (value: MaterialValue): MaterialValue => this.shaderVariant?.vec3(value) ?? value;
     const shadingNormal: MaterialValue = !present.has("normal")
       ? normalWorld
       : this.triplanar
