@@ -114,11 +114,17 @@ import { profileMaterialNodes } from "material-designer-runtime/profiling";
 
 const service = new MaterialBakeService();
 service.attachRenderer(renderer);
-const report = await profileMaterialNodes(service, session, { size: 512, runs: 5 });
+const report = await profileMaterialNodes(service, session, {
+  size: 512,
+  runs: 5,
+  logCompiledShaders: true,
+});
 ```
 
 The `/profiling` entry owns timestamp queries, shader inspection, workload accounting, matched-baseline
 compiles, and cold shader identities. None of those modules are imported by `material-designer-runtime`.
+`logCompiledShaders` adds collapsed console groups for each output's actual compiled Three material, timing
+values, and complete vertex/fragment WGSL; it is disabled unless requested.
 
 ## Persistent texture cache (opt-in)
 

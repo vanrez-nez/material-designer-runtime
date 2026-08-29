@@ -20,6 +20,8 @@ export interface NodeProfileOptions {
   size?: number; // render-target size, default 512
   runs?: number; // warm GPU renders per node (median taken), default 6
   compileRuns?: number; // independently cache-busted pipeline compiles per node (median taken), default 3
+  // Print collapsed console groups containing the compiled Three material and complete vertex/fragment WGSL.
+  logCompiledShaders?: boolean;
 }
 
 export interface NodeProfileShaderMetrics {

@@ -249,7 +249,24 @@ export function profileMaterialNodes(
       type PreparedProfileMaterial = {
         material: MeshBasicNodeMaterial;
         pipelineCompileMs: number;
+        vertexShader: string;
         fragmentShader: string;
+      };
+
+      const logCompiledVariant = (
+        label: string,
+        prepared: PreparedProfileMaterial,
+        gpuMs: number,
+      ): void => {
+        console.groupCollapsed(label);
+        console.log("Material", prepared.material);
+        console.log("Measurements", {
+          pipelineCompileMs: prepared.pipelineCompileMs,
+          gpuMs,
+        });
+        console.log("Vertex WGSL", prepared.vertexShader);
+        console.log("Fragment WGSL", prepared.fragmentShader);
+        console.groupEnd();
       };
 
       const prepare = async (
@@ -270,7 +287,7 @@ export function profileMaterialNodes(
             await compileMaterialAsync(renderer, material, target);
             compileSamples.push(performance.now() - compileStartedAt);
           }
-          const { fragmentShader } = await inspectMaterialShaderAsync(
+          const { vertexShader, fragmentShader } = await inspectMaterialShaderAsync(
             renderer,
             measuredMaterial!,
             target,
@@ -278,6 +295,7 @@ export function profileMaterialNodes(
           return {
             material: measuredMaterial!,
             pipelineCompileMs: median(compileSamples),
+            vertexShader,
             fragmentShader,
           };
         } catch (error) {
@@ -286,7 +304,11 @@ export function profileMaterialNodes(
         }
       };
 
-      const measure = async (colorNode: MaterialValue, identity: string) => {
+      const measure = async (
+        colorNode: MaterialValue,
+        identity: string,
+        consoleLabel?: string,
+      ) => {
         const prepared = await prepare(colorNode, identity);
         try {
           await gpuSample(prepared.material);
@@ -294,9 +316,15 @@ export function profileMaterialNodes(
           for (let index = 0; index < runs; index += 1) {
             gpuSamples.push(await gpuSample(prepared.material));
           }
+          const gpuMs = median(gpuSamples);
+          if (opts.logCompiledShaders && consoleLabel) {
+            console.groupCollapsed(`[material-profiler] ${consoleLabel}`);
+            logCompiledVariant("Compiled subtree material", prepared, gpuMs);
+            console.groupEnd();
+          }
           return {
             pipelineCompileMs: prepared.pipelineCompileMs,
-            gpuMs: median(gpuSamples),
+            gpuMs,
             fragmentShader: prepared.fragmentShader,
           };
         } finally {
@@ -308,6 +336,7 @@ export function profileMaterialNodes(
         isolatedNode: MaterialValue,
         baselineNode: MaterialValue,
         identity: string,
+        consoleLabel?: string,
       ) => {
         const isolated = await prepare(isolatedNode, `${identity}_isolated`);
         let baseline: PreparedProfileMaterial | null = null;
@@ -332,18 +361,28 @@ export function profileMaterialNodes(
             baselineSamples.push(baselineMs);
             deltaSamples.push(isolatedMs - baselineMs);
           }
+          const isolatedGpuMs = median(isolatedSamples);
+          const baselineGpuMs = median(baselineSamples);
+          const gpuPairedDeltaMs = median(deltaSamples);
+          if (opts.logCompiledShaders && consoleLabel) {
+            console.groupCollapsed(`[material-profiler] ${consoleLabel}`);
+            console.log("Paired GPU delta", gpuPairedDeltaMs);
+            logCompiledVariant("Isolated node material", isolated, isolatedGpuMs);
+            logCompiledVariant("Matched baseline material", baseline, baselineGpuMs);
+            console.groupEnd();
+          }
           return {
             isolated: {
               pipelineCompileMs: isolated.pipelineCompileMs,
-              gpuMs: median(isolatedSamples),
+              gpuMs: isolatedGpuMs,
               fragmentShader: isolated.fragmentShader,
             },
             baseline: {
               pipelineCompileMs: baseline.pipelineCompileMs,
-              gpuMs: median(baselineSamples),
+              gpuMs: baselineGpuMs,
               fragmentShader: baseline.fragmentShader,
             },
-            gpuPairedDeltaMs: median(deltaSamples),
+            gpuPairedDeltaMs,
           };
         } finally {
           isolated.material.dispose();
@@ -429,13 +468,19 @@ export function profileMaterialNodes(
         }
 
         try {
-          const subtree = await measure(subtreeNode, `${identity}_subtree`);
+          const consoleLabel = `${node.label ?? node.id} · ${output.label ?? output.key} (${node.type})`;
+          const subtree = await measure(
+            subtreeNode,
+            `${identity}_subtree`,
+            `${consoleLabel} · ancestor subtree`,
+          );
           row.subtreeCompileMs = subtree.pipelineCompileMs;
           row.subtreeGpuMs = subtree.gpuMs;
           const pair = await measurePair(
             isolatedNode,
             baselineNode ?? vec3(0.5, 0.5, 0.5),
             identity,
+            `${consoleLabel} · isolated node vs matched baseline`,
           );
           row.isolatedCompileMs = pair.isolated.pipelineCompileMs;
           row.isolatedGpuMs = pair.isolated.gpuMs;
