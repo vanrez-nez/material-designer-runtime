@@ -166,9 +166,21 @@ interface PipelineCacheLike {
 //
 // The private-field reach is deliberate and guarded — if a three version stops exposing `_pipelines` in
 // this shape we fall through to the stock sequential path rather than break baking.
+let warnedNoParallelCompile = false;
+
 async function compileSceneAsync(renderer: WebGPURenderer, scene: Scene): Promise<void> {
   const pipelines = (renderer as unknown as { _pipelines?: PipelineCacheLike })._pipelines;
   if (!pipelines || typeof pipelines.getForRender !== "function") {
+    // Correct, just ~2x slower to compile. Say so ONCE: this is the failure mode of a three upgrade that
+    // renames or reshapes the pipeline cache, and it would otherwise be an invisible performance
+    // regression rather than a bug anyone notices.
+    if (!warnedNoParallelCompile) {
+      warnedNoParallelCompile = true;
+      console.warn(
+        "[bake] three's pipeline cache is not in the expected shape; falling back to sequential pipeline " +
+          "compilation. Bakes stay correct but cold compiles take roughly twice as long.",
+      );
+    }
     await renderer.compileAsync(scene, compileCamera); // stock path: sequential, still correct
     return;
   }
