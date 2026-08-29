@@ -144,13 +144,71 @@ const compileScene = new Scene();
 const compileCamera = new OrthographicCamera(-1, 1, 1, -1, 0, 1);
 const compileQuads: QuadMesh[] = [];
 
+// three's pipeline cache, as far as we need it: `getForRender` synchronously kicks off pipeline creation
+// and pushes any in-flight promises into the array it is handed.
+interface PipelineCacheLike {
+  getForRender: (renderObject: unknown, promises?: unknown[]) => unknown;
+}
+
+// Compile `scene` with three's async path, but let the driver overlap the pipeline builds.
+//
+// three walks its compile work items ONE AT A TIME and awaits that object's `createRenderPipelineAsync`
+// before starting the next (Renderer.js: "Process compilation work items sequentially"). Dawn builds
+// pipelines on worker threads, so that await serialises work the driver is perfectly happy to run
+// concurrently — measured ~3x on 8 cores, and a little under half the wall time of a cold multi-material
+// bake (9 presets at 1024px: 8.0s -> 4.6s, with the pipeline-compile phase 6.5s -> 3.0s).
+//
+// Three's SYNCHRONOUS per-object work (node building, bindings, geometry) still runs strictly in order —
+// it mutates shared renderer state and must not interleave. Only the ASYNC waits move: `getForRender` is
+// intercepted so the promises it would hand three land in our list instead, which leaves three's per-object
+// `await Promise.all([])` a no-op. The whole list is awaited once here, before any caller draws, so the
+// render path still finds warm pipelines (verified: baked channels are byte-identical either way).
+//
+// The private-field reach is deliberate and guarded — if a three version stops exposing `_pipelines` in
+// this shape we fall through to the stock sequential path rather than break baking.
+async function compileSceneAsync(renderer: WebGPURenderer, scene: Scene): Promise<void> {
+  const pipelines = (renderer as unknown as { _pipelines?: PipelineCacheLike })._pipelines;
+  if (!pipelines || typeof pipelines.getForRender !== "function") {
+    await renderer.compileAsync(scene, compileCamera); // stock path: sequential, still correct
+    return;
+  }
+  // Restore exactly what was there: the method normally lives on the prototype, so an own property must be
+  // deleted rather than overwritten, or we would permanently shadow it.
+  const hadOwnProperty = Object.prototype.hasOwnProperty.call(pipelines, "getForRender");
+  const previousOwn = pipelines.getForRender;
+  const original = pipelines.getForRender.bind(pipelines);
+  const inFlight: Promise<unknown>[] = [];
+  pipelines.getForRender = (renderObject, promises) => {
+    if (!Array.isArray(promises)) return original(renderObject, promises);
+    const own: unknown[] = [];
+    const result = original(renderObject, own);
+    for (const promise of own) inFlight.push(promise as Promise<unknown>);
+    return result; // `promises` stays empty, so three skips its per-object await
+  };
+  let compileError: unknown = null;
+  try {
+    await renderer.compileAsync(scene, compileCamera);
+  } catch (error) {
+    compileError = error;
+  } finally {
+    if (hadOwnProperty) pipelines.getForRender = previousOwn;
+    else delete (pipelines as Partial<PipelineCacheLike>).getForRender;
+  }
+  // Always settle what we collected, even on failure — otherwise a rejected pipeline promise we took
+  // ownership of would surface as an unhandled rejection.
+  if (inFlight.length > 0) {
+    if (compileError !== null) await Promise.allSettled(inFlight);
+    else await Promise.all(inFlight);
+  }
+  if (compileError !== null) throw compileError;
+}
+
 // Pre-compile every channel's render pipeline OFF the blocking path. The normal render path
 // (`bakeQuad.render`) hits three's synchronous `device.createRenderPipeline`, which on Dawn/Metal defers
 // the heavy shader compile to submit time and pegs the GPU process — a single structural edit on a heavy
 // graph freezes the editor for seconds. `renderer.compileAsync` instead routes through
-// `createRenderPipelineAsync` (non-blocking). Three r184 deliberately processes scene work items
-// sequentially, yielding between them, so this improves responsiveness but is not channel-parallel
-// compilation. After it resolves the per-channel renders find warm pipelines and finish in ~ms. Caller must
+// `createRenderPipelineAsync` (non-blocking), and compileSceneAsync above lets those builds overlap.
+// After it resolves the per-channel renders find warm pipelines and finish in ~ms. Caller must
 // serialise: one `compileAsync` manages shared renderer state safely, but two concurrent calls would clobber it.
 export async function compileMaterialsAsync(
   renderer: WebGPURenderer,
@@ -168,7 +226,7 @@ export async function compileMaterialsAsync(
   // Compile against the supersample target the channels actually render into (format-matched pipeline).
   renderer.setRenderTarget(ssTargetsFor(destSize * SS, destSize * SS, shaderVariant).ssRT);
   try {
-    await renderer.compileAsync(compileScene, compileCamera);
+    await compileSceneAsync(renderer, compileScene);
   } finally {
     renderer.setRenderTarget(previous);
   }
