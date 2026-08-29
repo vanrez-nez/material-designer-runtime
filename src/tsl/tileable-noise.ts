@@ -42,6 +42,19 @@ export const pnoise2 = Fn(([P, rep]: V[]): V => {
   const fadexy = fade(Pf.xy) as V;
   const n_x = mix(vec2(n00, n01), vec2(n10, n11), fadexy.x) as V;
   return mix(n_x.x, n_x.y, fadexy.y).mul(2.3);
+}).setLayout({
+  // A LAYOUT, not decoration: without one, TSL inlines this whole body at EVERY call site, and the call
+  // sites multiply fast — curlVec2 takes four central differences, so the stone/erosion bases emit five
+  // copies each, and Tileable Warp emits two. Pipeline compile tracks emitted WGSL bytes almost linearly,
+  // so those copies were the single largest term in any Perlin-based shader. With the layout it is one
+  // shared `fn` per shader and a call at each site — byte-identical math (its gradient sibling below has
+  // always been declared this way).
+  name: "md_periodic_perlin_2d",
+  type: "float",
+  inputs: [
+    { name: "P", type: "vec2" },
+    { name: "rep", type: "vec2" },
+  ],
 });
 
 // The same periodic Perlin value plus its analytic x/y derivatives. xyz = (value, d/dx, d/dy). This is an

@@ -1,5 +1,11 @@
 import { Fn, Loop, float, int, vec2, vec3, floor, select, max, mix, smoothstep, pow } from "three/tsl";
 import type { MaterialValue } from "../graph/types";
+// The PCG3D cell hash, shared with the noise library. It lives there behind a setLayout, so it is
+// emitted as ONE `fn md_hash_pcg3d_i` per shader instead of being inlined at every call site. This file
+// used to carry a byte-identical private copy WITHOUT a layout, which meant the whole ~20-statement
+// bit-mix was re-emitted at each cellHash — twice over in distance-to-edge (one hash per loop pass) —
+// and pipeline compile tracks emitted WGSL almost linearly. Same transcription, same numbers.
+import { hashInt3ToVec3 } from "./noise/hash";
 
 // Faithful TSL port of Blender's Voronoi — plan L4 / decision 2. Transcribed verbatim from Blender GPU
 // source:
@@ -15,29 +21,6 @@ type NamedLoop = (
   body: (variables: Record<string, V>) => void,
 ) => void;
 const namedLoop = Loop as unknown as NamedLoop;
-const INV_2147483648 = 1 / 0x80000000; // float(0x7fffffff) rounds to 2147483648 in f32 — match Blender.
-
-function hashInt3ToVec3(kx: V, ky: V, kz: V): V {
-  const x = kx.mul(1664525).add(1013904223).toVar();
-  const y = ky.mul(1664525).add(1013904223).toVar();
-  const z = kz.mul(1664525).add(1013904223).toVar();
-  x.assign(x.add(y.mul(z)));
-  y.assign(y.add(z.mul(x)));
-  z.assign(z.add(x.mul(y)));
-  x.assign(x.bitXor(x.shiftRight(16)));
-  y.assign(y.bitXor(y.shiftRight(16)));
-  z.assign(z.bitXor(z.shiftRight(16)));
-  x.assign(x.add(y.mul(z)));
-  y.assign(y.add(z.mul(x)));
-  z.assign(z.add(x.mul(y)));
-  const mask = int(0x7fffffff);
-  return vec3(
-    float(x.bitAnd(mask)).mul(INV_2147483648),
-    float(y.bitAnd(mask)).mul(INV_2147483648),
-    float(z.bitAnd(mask)).mul(INV_2147483648),
-  );
-}
-
 // Floored modulo of an integer cell coordinate into [0, period). Wrapping the PCG-hash input makes the
 // random feature points periodic, so a Voronoi cell at index `period` matches index 0 — the offline tile
 // edge becomes seamless. (The neighbour offset i/j/k stays unwrapped, so distances are unaffected.) `period`
