@@ -21,11 +21,13 @@ export {
   bakeService,
   type BakeOptions,
   type BakeReport,
+  type BakeTimingBreakdown,
 } from "./graph/bake-service";
 export {
   type NodeProfileOptions,
   type NodeProfileReport,
   type NodeProfileRow,
+  type NodeProfileShaderMetrics,
 } from "./graph/node-profiler";
 export {
   compileGraph,

@@ -18,6 +18,7 @@ import {
   type PbrSocket,
 } from "./types";
 import { SURFACE_CHANNELS, type MaterialBakeService, type BakedTextureSet } from "./bake-service";
+import { createShaderCacheBuster, type ShaderCacheBuster } from "./shader-cache-bust";
 
 // Parallax-occlusion march steps (LINEAR cost, paid per preview fragment — the dominant GPU cost of the
 // effect). 12 is the perf/quality balance.
@@ -85,13 +86,17 @@ export class TexturedSurface {
   // during a rebuild submits a texture being resized/recreated ("Destroyed texture used in a submit").
   private processingDepth = 0;
   private idleWaiters: Array<() => void> = [];
+  private readonly shaderCacheBuster: ShaderCacheBuster | null;
 
   constructor(
     private readonly graph: MaterialGraphSource,
     private readonly service: MaterialBakeService,
     // Identifies this surface in bake telemetry so UI can scope its progress.
     private readonly source?: string,
+    // Benchmark-only identity forwarded to every bake shader and the final visible surface shader.
+    private readonly shaderCacheNonce?: string,
   ) {
+    this.shaderCacheBuster = createShaderCacheBuster(shaderCacheNonce);
     this.set = service.createTextureSet(SURFACE_CHANNELS, this.surfaceBakeSize());
     // Startup fallback: no renderer yet → procedural live material so the surface is valid; the first
     // refresh() (after the service gets a renderer) switches to the baked offline surface.
@@ -409,6 +414,7 @@ export class TexturedSurface {
           label: "surface",
           source: this.source,
           bypassCache,
+          shaderCacheNonce: this.shaderCacheNonce,
         });
         this.lastBakeMs = performance.now() - t0;
         if (changed || !this.wiredOnce || familyChanged) {
@@ -474,6 +480,9 @@ export class TexturedSurface {
       this.triplanar
         ? triplanarColor(this.set.texture(ch)!, scale, sharp)
         : sampleUv(this.set.texture(ch)!);
+    const coldScalar = (value: MaterialValue): MaterialValue =>
+      this.shaderCacheBuster?.scalar(value) ?? value;
+    const coldVec3 = (value: MaterialValue): MaterialValue => this.shaderCacheBuster?.vec3(value) ?? value;
     const shadingNormal: MaterialValue = !present.has("normal")
       ? normalWorld
       : this.triplanar
@@ -488,18 +497,18 @@ export class TexturedSurface {
       return;
     }
     // Common channels — every family lights these.
-    m.colorNode = present.has("baseColor") ? sample("baseColor") : null;
-    m.normalNode = present.has("normal") ? shadingNormal : null;
+    m.colorNode = present.has("baseColor") ? coldVec3(sample("baseColor").rgb) : null;
+    m.normalNode = present.has("normal") ? coldVec3(shadingNormal) : null;
     // Roughness/metalness only exist on Standard-derived families.
     if (caps.roughMetal) {
-      m.roughnessNode = present.has("roughness") ? sample("roughness").r : null;
-      m.metalnessNode = present.has("metallic") ? sample("metallic").r : null;
+      m.roughnessNode = present.has("roughness") ? coldScalar(sample("roughness").r) : null;
+      m.metalnessNode = present.has("metallic") ? coldScalar(sample("metallic").r) : null;
     }
     if (caps.ao) {
       const vAo = attribute("vertexAo", "float");
-      m.aoNode = present.has("ambientOcclusion") ? sample("ambientOcclusion").r.mul(vAo) : vAo;
+      m.aoNode = coldScalar(present.has("ambientOcclusion") ? sample("ambientOcclusion").r.mul(vAo) : vAo);
     }
-    if (caps.emissive) m.emissiveNode = present.has("emission") ? sample("emission") : null;
+    if (caps.emissive) m.emissiveNode = present.has("emission") ? coldVec3(sample("emission").rgb) : null;
     m.needsUpdate = true;
   }
 

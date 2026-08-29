@@ -1,4 +1,4 @@
-import { vec2, vec3, float, int, floor, clamp, length, min, pow, smoothstep } from "three/tsl";
+import { Loop, vec2, vec3, float, int, floor, clamp, length, min, pow, smoothstep } from "three/tsl";
 import type { MaterialValue } from "../../graph/types";
 import { hashCell2ToVec3 } from "./hash";
 
@@ -11,6 +11,11 @@ import { hashCell2ToVec3 } from "./hash";
 // Bases take the period-scaled 2D coord `p` and a square period (cellular noises ignore aspect). `period`
 // may be a JS number or a uniform node (a live `scale`). Returns [0,1].
 type V = MaterialValue;
+type NamedLoop = (
+  params: { start: number; end: V; name: string; condition: "<" | "<=" },
+  body: (variables: Record<string, V>) => void,
+) => void;
+const namedLoop = Loop as unknown as NamedLoop;
 const SMOOTH_EXP = 2.0; // 1 / edge-smoothness (smoothness 0.5)
 
 // Worley (F1): 1 − distance-to-nearest-feature, in [0,1]. A 9-tap 2D search over the neighbour cells, each
@@ -23,13 +28,14 @@ export function worleyBase01(p: V, perX: number | V, perY: number | V): V {
   const ix = int(i.x);
   const iy = int(i.y);
   const local = vec3(f.x, f.y, float(0)) as V;
-  let d: V = float(1e10);
-  for (let dx = -1; dx <= 1; dx++)
-    for (let dy = -1; dy <= 1; dy++) {
+  const d = float(1e10).toVar();
+  namedLoop({ start: -1, end: int(1), name: "dx", condition: "<=" }, ({ dx }) => {
+    namedLoop({ start: -1, end: int(1), name: "dy", condition: "<=" }, ({ dy }) => {
       const h = hashCell2ToVec3(ix.add(dx), iy.add(dy), perX, perY) as V; // feature jitter (xy) + depth (z)
-      const pp = vec3(float(dx).add(h.x), float(dy).add(h.y), h.z) as V; // feature point in this neighbour cell
-      d = min(d, length(pp.sub(local))) as V;
-    }
+      const pp = vec3(dx.add(h.x), dy.add(h.y), h.z) as V; // feature point in this neighbour cell
+      d.assign(min(d, length(pp.sub(local))));
+    });
+  });
   return clamp(float(1).sub(d), 0, 1) as V;
 }
 
@@ -39,15 +45,16 @@ export function voronoiSmoothBase01(p: V, perX: number | V, perY: number | V): V
   const f = p.sub(i) as V;
   const ix = int(i.x);
   const iy = int(i.y);
-  let va: V = float(0);
-  let wt: V = float(0);
-  for (let dx = -1; dx <= 1; dx++)
-    for (let dy = -1; dy <= 1; dy++) {
+  const va = float(0).toVar();
+  const wt = float(0).toVar();
+  namedLoop({ start: -1, end: int(1), name: "dx", condition: "<=" }, ({ dx }) => {
+    namedLoop({ start: -1, end: int(1), name: "dy", condition: "<=" }, ({ dy }) => {
       const o = hashCell2ToVec3(ix.add(dx), iy.add(dy), perX, perY) as V; // xy = offset, z = cell value
       const d = length(vec2(dx, dy).sub(f).add(vec2(o.x, o.y))) as V;
       const ww = pow(smoothstep(1.414, 0, d), SMOOTH_EXP) as V;
-      va = va.add(o.z.mul(ww)) as V;
-      wt = wt.add(ww) as V;
-    }
+      va.addAssign(o.z.mul(ww));
+      wt.addAssign(ww);
+    });
+  });
   return va.div(wt.max(1e-4)) as V;
 }

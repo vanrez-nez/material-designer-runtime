@@ -25,6 +25,9 @@ export interface MaterialGraphRuntimeOptions {
   registry?: NodeRegistry;
   bakeService?: MaterialBakeService;
   source?: string;
+  // Benchmark/diagnostic only. A different value changes the actual WGSL identity for bake and visible
+  // surface shaders without changing their output, defeating cross-reload shader/pipeline cache hits.
+  shaderCacheNonce?: string;
   // Cross-session baked-texture cache. OPT-IN: omit it (or pass false) and nothing is persisted and no
   // storage is touched. Pass options to get the built-in IndexedDB store, or a BakeTextureCache you built
   // around your own BakeCacheStore.
@@ -43,7 +46,12 @@ export class MaterialGraphRuntime {
   constructor(options: MaterialGraphRuntimeOptions = {}) {
     this.service = options.bakeService ?? bakeService;
     this.graph = new MaterialGraphSession(options.document, options.registry ?? defaultRegistry);
-    this.surface = new TexturedSurface(this.graph, this.service, options.source);
+    this.surface = new TexturedSurface(
+      this.graph,
+      this.service,
+      options.source,
+      options.shaderCacheNonce,
+    );
     if (options.cache instanceof BakeTextureCache) {
       this.service.setCache(options.cache);
     } else if (options.cache) {

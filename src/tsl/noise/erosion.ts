@@ -1,6 +1,6 @@
 import { vec2, float, clamp } from "three/tsl";
 import type { MaterialValue } from "../../graph/types";
-import { pnoise2 } from "../tileable-noise";
+import { pnoise2, pnoise2Gradient } from "../tileable-noise";
 import { curlVec2 } from "./flow";
 
 // Erosion-style noise (representative periodic variant of @lumiey erosion12). The faithful original is a
@@ -15,5 +15,14 @@ export function erosionBase01(p: V, per: number, _perY: number): V {
   const q = p.add(flow.mul(0.6)) as V; // warp the domain along the flow → directional channels
   const h = pnoise2(q, vec2(per, per)).mul(0.5).add(0.5) as V; // periodic Perlin, [0,1]
   // Ridge transform: 1 - |2h-1| concentrates value into sharp crests between the carved channels.
+  return clamp(float(1).sub(h.mul(2).sub(1).abs()), 0, 1) as V;
+}
+
+// Opt-in analytic-gradient form of the same periodic domain-warp + ridge composition. Two Perlin
+// evaluations per octave instead of the finite-difference path's five.
+export function erosionAnalyticBase01(p: V, per: number, _perY: number): V {
+  const sample = pnoise2Gradient(p, vec2(per, per)) as V;
+  const q = p.add(vec2(sample.y, sample.z).mul(0.6)) as V;
+  const h = pnoise2(q, vec2(per, per)).mul(0.5).add(0.5) as V;
   return clamp(float(1).sub(h.mul(2).sub(1).abs()), 0, 1) as V;
 }

@@ -1,5 +1,5 @@
 import { int, float, floor, max, smoothstep } from "three/tsl";
-import type { MaterialNodeDef, MaterialValue, PortDef } from "../../types";
+import type { MaterialNodeDef, MaterialValue, NodeProfileWorkloadStage, PortDef } from "../../types";
 import {
   blenderVoronoiF1,
   blenderVoronoiF1Color,
@@ -11,12 +11,16 @@ import {
   blenderVoronoiSmoothF1Color,
   blenderVoronoiSmoothF1Pos,
   blenderVoronoiDistanceToEdge,
+  blenderVoronoiDistanceToEdge2D,
+  blenderVoronoiCellRandom2D,
 } from "../../../tsl/blender-voronoi";
 import { relaxedCellOffsets } from "../../../tsl/lloyd-points";
 import { relaxedVoronoiDistanceToEdge, relaxedVoronoiCellValue } from "../../../tsl/relaxed-voronoi";
 
 const METRICS = ["euclidean", "manhattan", "chebychev", "minkowski"];
-const FEATURES = ["f1", "f2", "smooth-f1", "distance-to-edge"];
+const FEATURES = ["f1", "f2", "smooth-f1", "distance-to-edge", "distance-to-edge-2d"];
+const isEdgeFeature = (feature: string): boolean =>
+  feature === "distance-to-edge" || feature === "distance-to-edge-2d";
 
 // Feature-dependent outputs (declare()): F1/F2/Smooth-F1 expose Distance/Color/Position; Distance-to-Edge
 // exposes only Distance.
@@ -35,6 +39,48 @@ const EDGE_OUTPUTS: PortDef[] = [
   { key: "random", label: "Random", kind: "float" },
 ];
 const COORD_INPUT: PortDef[] = [{ key: "coord", kind: "vector" }];
+
+function voronoiWorkload(params: Record<string, unknown>, outputKey: string) {
+  const feature = (params.feature as string) ?? "f1";
+  const relax = Math.max(0, Math.round(Number(params.relax ?? 0)));
+  const stage = (name: string, iterations: number, primitive: string) => ({
+    name,
+    iterations,
+    primitive,
+    primitiveEvaluations: iterations,
+  });
+  let kernel = feature;
+  let stages: NodeProfileWorkloadStage[];
+
+  if (feature === "distance-to-edge-2d") {
+    kernel = "distance-to-edge-2d";
+    stages =
+      outputKey === "random"
+        ? [stage("nearest 2d feature", 9, "pcg-cell-hash")]
+        : [stage("nearest 2d feature", 9, "pcg-cell-hash"), stage("nearest 2d edge", 9, "pcg-cell-hash")];
+  } else if (feature === "distance-to-edge" && relax > 0) {
+    kernel = "relaxed-distance-to-edge-2d";
+    stages =
+      outputKey === "random"
+        ? [stage("nearest seed", 9, "uniform-seed-lookup"), stage("winning cell value", 1, "uniform-value-lookup")]
+        : [stage("nearest seed", 9, "uniform-seed-lookup"), stage("nearest edge", 9, "uniform-seed-lookup")];
+  } else if (feature === "distance-to-edge") {
+    kernel = "blender-distance-to-edge-3d";
+    stages =
+      outputKey === "random"
+        ? [stage("nearest cell for random", 27, "pcg-cell-hash")]
+        : [stage("nearest feature", 27, "pcg-cell-hash"), stage("nearest edge", 27, "pcg-cell-hash")];
+  } else {
+    stages = [stage(`${feature} neighborhood`, 27, "pcg-cell-hash")];
+  }
+
+  return {
+    kernel,
+    scope: "raw-isolated-node" as const,
+    stages,
+    totalPrimitiveEvaluations: stages.reduce((total, item) => total + item.primitiveEvaluations, 0),
+  };
+}
 
 // Deterministic per-cell random in [0,1] (stable across bakes). Indexed by the cell's linear id; the array
 // IS the tile period, so wrapped lookups repeat seamlessly across the bake-tile edge.
@@ -78,7 +124,7 @@ export const voronoiNode: MaterialNodeDef = {
   ],
   declare(params) {
     const feature = (params.feature as string) ?? "f1";
-    return { inputs: COORD_INPUT, outputs: feature === "distance-to-edge" ? EDGE_OUTPUTS : FULL_OUTPUTS };
+    return { inputs: COORD_INPUT, outputs: isEdgeFeature(feature) ? EDGE_OUTPUTS : FULL_OUTPUTS };
   },
   // Context-sensitive controls: `exponent` only affects the Minkowski metric, `smoothness` only Smooth-F1, and
   // `relax` (Lloyd) only the distance-to-edge feature (offline). Hide the ones that do nothing in the current
@@ -90,8 +136,8 @@ export const voronoiNode: MaterialNodeDef = {
     const show = new Set(["scale", "randomness", "metric", "feature"]);
     if (metric === "minkowski") show.add("exponent");
     if (feature === "smooth-f1") show.add("smoothness");
-    if (feature === "distance-to-edge") {
-      show.add("relax");
+    if (isEdgeFeature(feature)) {
+      if (feature === "distance-to-edge") show.add("relax");
       show.add("edgeWidth");
     }
     // In the relaxed distance-to-edge path, `scale` (→ period) and `randomness` (→ initial jitter) are consumed
@@ -107,6 +153,9 @@ export const voronoiNode: MaterialNodeDef = {
           ? { ...p, bakeStructural: true }
           : p,
       );
+  },
+  profileWorkload(params, outputKey) {
+    return voronoiWorkload(params, outputKey);
   },
   build(ctx) {
     // Param contract (see memory: node-param-contract): metric/feature/relax are build-time selects/ints
@@ -183,6 +232,20 @@ export const voronoiNode: MaterialNodeDef = {
           distance: edgeDist,
           edges: smoothstep(float(0), wEdge, edgeDist).oneMinus() as MaterialValue,
           random: blenderVoronoiF1Color(p, r, m, e, period).x,
+        };
+      }
+      case "distance-to-edge-2d": {
+        // The experimental feature is 2D only. Live preview retains the faithful 3D kernel until separately
+        // validated; offline uses the cheaper UV-plane tessellation and an aligned per-cell random.
+        const edgeDist = offline
+          ? blenderVoronoiDistanceToEdge2D(p, r, period)
+          : blenderVoronoiDistanceToEdge(p, r, period);
+        return {
+          distance: edgeDist,
+          edges: smoothstep(float(0), wEdge, edgeDist).oneMinus() as MaterialValue,
+          random: offline
+            ? blenderVoronoiCellRandom2D(p, r, period)
+            : blenderVoronoiF1Color(p, r, m, e, period).x,
         };
       }
       case "f2":

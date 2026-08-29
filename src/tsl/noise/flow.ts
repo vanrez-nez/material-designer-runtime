@@ -1,6 +1,6 @@
 import { Fn, vec2, vec3, float, clamp, max, abs } from "three/tsl";
 import type { MaterialValue } from "../../graph/types";
-import { pnoise2 } from "../tileable-noise";
+import { pnoise2, pnoise2Gradient } from "../tileable-noise";
 
 // Curl-flow family (@lumiey curl/paper/stone/wool), made seamless by using the PERIODIC Perlin `pnoise2`
 // (tileable-noise.ts) as the underlying potential — every sample wraps at the integer period, so the derived
@@ -43,5 +43,13 @@ export function woolBase01(p: V, per: number, _perY: number): V {
 // Stone (@lumiey stone12): Perlin domain-warped by the curl flow → veined stone. [0,1].
 export function stoneBase01(p: V, per: number, _perY: number): V {
   const warp = curlVec2(p, per).mul(0.4) as V;
+  return pn(p.add(warp), per).mul(0.5).add(0.5) as V;
+}
+
+// Opt-in stone approximation: analytic Perlin derivatives replace the four finite-difference samples used
+// by curlVec2. One derivative sample + one warped value sample = two Perlin evaluations per octave, not five.
+export function stoneAnalyticBase01(p: V, per: number, _perY: number): V {
+  const sample = pnoise2Gradient(p, vec2(per, per)) as V;
+  const warp = vec2(sample.y, sample.z).mul(0.4) as V;
   return pn(p.add(warp), per).mul(0.5).add(0.5) as V;
 }

@@ -10,9 +10,20 @@ import {
   migrateMaterialDocument,
   readMaterialSurface,
   readOutputResolution,
+  type BakeReport,
   type MaterialGraphDocument,
   type MaterialType,
 } from "../src";
+import { createBakeTimingBreakdown } from "../src/graph/bake-service";
+import { createShaderCacheBuster } from "../src/graph/shader-cache-bust";
+import {
+  deriveMeasuredNodeCosts,
+  measureNodeShaderMetrics,
+  profilableNodeOutputs,
+  profileWorkload,
+  type NodeProfileRow,
+} from "../src/graph/node-profiler";
+import { vec3 } from "three/tsl";
 import {
   MeshStandardNodeMaterial,
   MeshPhysicalNodeMaterial,
@@ -66,6 +77,202 @@ function constantDoc(): MaterialGraphDocument {
     ],
   };
 }
+
+describe("bake telemetry", () => {
+  it("totals generation phases without folding in serial queue wait", () => {
+    const timings = createBakeTimingBreakdown(13, {
+      graphCompileMs: 2,
+      cacheDispatchMs: 3,
+      pipelineCompileMs: 5,
+      channelDispatchMs: 7,
+      cacheRestoreMs: 0,
+      gpuWaitMs: 11,
+    });
+
+    expect(timings.queueWaitMs).toBe(13);
+    expect(timings.generationMs).toBe(28);
+  });
+
+  it("pins the additive BakeReport fields while retaining compatibility totals", () => {
+    const timings = createBakeTimingBreakdown(0, {
+      graphCompileMs: 4,
+      channelDispatchMs: 6,
+      gpuWaitMs: 8,
+    });
+    const report: BakeReport = {
+      runId: 1,
+      source: "asphalt",
+      phase: "done",
+      nodeCount: 31,
+      resolution: 1024,
+      channels: ["baseColor", "roughness", "normal", "height"],
+      timings,
+      compileMs: timings.graphCompileMs,
+      texturesTotal: 4,
+      totalMs: timings.generationMs,
+    };
+
+    expect(report.resolution).toBe(1024);
+    expect(report.channels).toEqual(["baseColor", "roughness", "normal", "height"]);
+    expect(report.compileMs).toBe(report.timings.graphCompileMs);
+    expect(report.totalMs).toBe(report.timings.generationMs);
+    expect(report.texturesTotal).toBe(report.channels.length);
+  });
+});
+
+describe("cold benchmark shader identity", () => {
+  it("emits the same WGSL identity within one run and a different one for the next run", () => {
+    const runA1 = createShaderCacheBuster("run-a")!.vec3(vec3(0.1, 0.2, 0.3));
+    const runA2 = createShaderCacheBuster("run-a")!.vec3(vec3(0.1, 0.2, 0.3));
+    const runB = createShaderCacheBuster("run-b")!.vec3(vec3(0.1, 0.2, 0.3));
+    const wgsl = (node: { functionNode: { code: string } }): string => node.functionNode.code;
+
+    expect(wgsl(runA1)).toBe(wgsl(runA2));
+    expect(wgsl(runA1)).not.toBe(wgsl(runB));
+    expect(wgsl(runA1)).toContain("guard *");
+  });
+});
+
+describe("node profile measurement", () => {
+  it("profiles dynamic node outputs port-for-port", () => {
+    const document: MaterialGraphDocument = {
+      version: 4,
+      nodes: [
+        {
+          id: "cells",
+          type: "voronoi",
+          params: { feature: "distance-to-edge" },
+          enabled: true,
+        },
+      ],
+      edges: [],
+    };
+
+    expect(profilableNodeOutputs(document, defaultRegistry, ["cells"]).map(({ output }) => output.key)).toEqual([
+      "distance",
+      "edges",
+      "random",
+    ]);
+  });
+
+  it("derives measured node-local deltas from matched isolated baselines", () => {
+    const row = (
+      nodeId: string,
+      isolatedCompileMs: number,
+      baselineCompileMs: number,
+      isolatedGpuMs: number,
+      baselineGpuMs: number,
+    ): NodeProfileRow => ({
+      nodeId,
+      type: "constant-field",
+      outputKey: "field",
+      outputKind: "float",
+      graphCompileMs: 0,
+      isolatedGraphCompileMs: 0,
+      subtreeCompileMs: 20,
+      subtreeGpuMs: 10,
+      isolatedCompileMs,
+      isolatedGpuMs,
+      baselineCompileMs,
+      baselineGpuMs,
+      compileMs: 0,
+      gpuMs: 0,
+    });
+    const rows = [row("source", 10, 2, 5, 1), row("consumer", 15, 10, 9, 5)];
+    deriveMeasuredNodeCosts(rows);
+
+    expect(rows[0].compileMs).toBe(8);
+    expect(rows[0].gpuMs).toBe(4);
+    expect(rows[1].compileMs).toBe(5);
+    expect(rows[1].gpuMs).toBe(4);
+  });
+
+  it("uses the interleaved paired GPU delta instead of drifting independent medians", () => {
+    const row: NodeProfileRow = {
+      nodeId: "paired",
+      type: "constant-field",
+      outputKey: "field",
+      outputKind: "float",
+      graphCompileMs: 0,
+      isolatedGraphCompileMs: 0,
+      subtreeCompileMs: 0,
+      subtreeGpuMs: 0,
+      isolatedCompileMs: 12,
+      isolatedGpuMs: 0.4,
+      baselineCompileMs: 4,
+      baselineGpuMs: 0.6,
+      compileMs: 0,
+      gpuPairedDeltaMs: 0.25,
+      gpuMs: 0,
+    };
+    deriveMeasuredNodeCosts([row]);
+    expect(row.compileMs).toBe(8);
+    expect(row.gpuMs).toBe(0.25);
+  });
+
+  it("calculates the selected tileable-noise primitive workload", () => {
+    const stone = {
+      id: "stone",
+      type: "tileable-noise",
+      params: { noiseType: "perlin-fbm", preset: "stone", octaves: 6, tileSize: "512" },
+      enabled: true,
+    };
+    const value = {
+      id: "value",
+      type: "tileable-noise",
+      params: { noiseType: "value", preset: "none", octaves: 6, tileSize: "off" },
+      enabled: true,
+    };
+    const output = { key: "field", kind: "float" as const };
+
+    expect(profileWorkload(stone, output, defaultRegistry)).toMatchObject({
+      kernel: "stone",
+      configuredTileSize: 512,
+      totalPrimitiveEvaluations: 30,
+    });
+    expect(profileWorkload(value, output, defaultRegistry)).toMatchObject({
+      kernel: "value",
+      totalPrimitiveEvaluations: 24,
+    });
+    stone.params.preset = "stone-analytic";
+    expect(profileWorkload(stone, output, defaultRegistry)).toMatchObject({
+      kernel: "stone-analytic",
+      totalPrimitiveEvaluations: 12,
+    });
+  });
+
+  it("calculates output-specific Voronoi search work", () => {
+    const node = {
+      id: "cells",
+      type: "voronoi",
+      params: { feature: "distance-to-edge", relax: 0 },
+      enabled: true,
+    };
+    expect(profileWorkload(node, { key: "distance", kind: "float" }, defaultRegistry)?.totalPrimitiveEvaluations).toBe(54);
+    expect(profileWorkload(node, { key: "random", kind: "float" }, defaultRegistry)?.totalPrimitiveEvaluations).toBe(27);
+    node.params.relax = 3;
+    expect(profileWorkload(node, { key: "edges", kind: "float" }, defaultRegistry)?.totalPrimitiveEvaluations).toBe(18);
+    expect(profileWorkload(node, { key: "random", kind: "float" }, defaultRegistry)?.totalPrimitiveEvaluations).toBe(10);
+    node.params.feature = "distance-to-edge-2d";
+    node.params.relax = 0;
+    expect(profileWorkload(node, { key: "edges", kind: "float" }, defaultRegistry)).toMatchObject({
+      kernel: "distance-to-edge-2d",
+      totalPrimitiveEvaluations: 18,
+    });
+    expect(profileWorkload(node, { key: "random", kind: "float" }, defaultRegistry)?.totalPrimitiveEvaluations).toBe(9);
+  });
+
+  it("measures isolated WGSL growth against its matched baseline", () => {
+    const metrics = measureNodeShaderMetrics(
+      "fn helper() -> f32 { return 1.0; }\nfn main() { for (var i = 0; i < 2; i++) {} }",
+      "fn main() {}",
+    );
+    expect(metrics.fragmentByteDelta).toBeGreaterThan(0);
+    expect(metrics.isolatedFunctionCount).toBe(2);
+    expect(metrics.baselineFunctionCount).toBe(1);
+    expect(metrics.isolatedLoopCount).toBe(1);
+  });
+});
 
 describe("material runtime document session", () => {
   it("loads the default graph and exposes output resolution", () => {

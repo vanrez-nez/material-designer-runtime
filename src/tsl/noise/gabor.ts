@@ -1,4 +1,4 @@
-import { Fn, float, int, vec2, floor, cos, sin, exp, dot, mix, step } from "three/tsl";
+import { Fn, Loop, float, int, vec2, floor, cos, sin, exp, dot, mix, step } from "three/tsl";
 import type { MaterialValue } from "../../graph/types";
 import { hashCell2ToVec3Seed } from "./hash";
 
@@ -15,6 +15,11 @@ import { hashCell2ToVec3Seed } from "./hash";
 // integer cell index mod `period` (see hash.ts wrapAxis), so the offline tile edge repeats exactly. We use the
 // lib's PCG3D hash rather than Blender's, so the RNG pattern differs but the algorithm/statistics are identical.
 type V = MaterialValue;
+type NamedLoop = (
+  params: { start: number; end: V; name: string; condition: "<" | "<=" },
+  body: (variables: Record<string, V>) => void,
+) => void;
+const namedLoop = Loop as unknown as NamedLoop;
 const TAU = 6.283185307179586;
 const PI = Math.PI;
 const IMPULSES = 8; // Blender IMPULSES_COUNT
@@ -26,16 +31,16 @@ export const gaborValue2D = Fn(([uv, period, frequency, isotropy, orientation]: 
   const cell = floor(coords) as V;
   const local = coords.sub(cell) as V;
   const sum = float(0).toVar(); // Σ of the phasor's imaginary (sin) part — the Value output needs only this
-  for (let j = -1; j <= 1; j++) {
-    for (let i = -1; i <= 1; i++) {
+  namedLoop({ start: -1, end: int(1), name: "j", condition: "<=" }, ({ j }) => {
+    namedLoop({ start: -1, end: int(1), name: "i", condition: "<=" }, ({ i }) => {
       const cx = int(cell.x).add(i) as V; // integer cell index (wrapped mod period inside the hash → seamless)
       const cy = int(cell.y).add(j) as V;
       const pcs = local.sub(vec2(i, j)) as V; // position in this cell's local space
-      for (let k = 0; k < IMPULSES; k++) {
+      namedLoop({ start: 0, end: int(IMPULSES), name: "k", condition: "<" }, ({ k }) => {
         // Per-impulse randoms: one PCG3D vec3 gives kernel centre (xy) + Bernoulli weight (z); a second seed
         // gives the orientation jitter. (Blender uses 3 separate hashes; the exact RNG differs regardless.)
-        const hA = hashCell2ToVec3Seed(cx, cy, k * 2, period, period);
-        const hB = hashCell2ToVec3Seed(cx, cy, k * 2 + 1, period, period);
+        const hA = hashCell2ToVec3Seed(cx, cy, k.mul(2), period, period);
+        const hB = hashCell2ToVec3Seed(cx, cy, k.mul(2).add(1), period, period);
         const orient = orientation.add(hB.x.sub(0.5).mul(PI).mul(isotropy)) as V;
         const pks = pcs.sub(vec2(hA.x, hA.y)) as V; // position relative to this impulse's kernel centre
         const d2 = dot(pks, pks) as V;
@@ -45,9 +50,9 @@ export const gaborValue2D = Fn(([uv, period, frequency, isotropy, orientation]: 
         const weight = mix(float(-1), float(1), step(0.5, hA.z)); // Bernoulli ±1
         const inside = float(1).sub(step(1.0, d2)); // 1 while d² < 1, else 0 (kernel support cutoff)
         sum.addAssign(sin(angle).mul(env).mul(weight).mul(inside));
-      }
-    }
-  }
+      });
+    });
+  });
   // Value = (Σ_imag / 6σ)·0.5 + 0.5, σ = sqrt(IMPULSES·0.5·0.25) = 1. Blender doesn't clamp; ~99.7% ∈ [0,1].
   return sum.div(6).mul(0.5).add(0.5);
 });

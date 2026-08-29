@@ -31,6 +31,14 @@ export const hashInt3ToVec3 = Fn(([kx, ky, kz]: V[]): V => {
     float(y.bitAnd(mask)).mul(INV_2147483648),
     float(z.bitAnd(mask)).mul(INV_2147483648),
   );
+}).setLayout({
+  name: "md_hash_pcg3d_i",
+  type: "vec3",
+  inputs: [
+    { name: "kx", type: "int" },
+    { name: "ky", type: "int" },
+    { name: "kz", type: "int" },
+  ],
 });
 
 // Floored modulo of an integer cell coordinate into [0, period) — wrapping the hash input makes the lattice
@@ -62,6 +70,6 @@ export function hashCell2ToVec3(ix: V, iy: V, perX: number | V, perY: number | V
 // Like hashCell2ToVec3 but with a build-time `seed` in the z slot — call with different seeds to get extra
 // independent per-cell randoms (e.g. a tile generator needs position + size + rotation + value). The seed is
 // NOT wrapped, so each seed yields a distinct random set with the same x/y tiling period.
-export function hashCell2ToVec3Seed(ix: V, iy: V, seed: number, perX: number | V, perY: number | V): V {
+export function hashCell2ToVec3Seed(ix: V, iy: V, seed: number | V, perX: number | V, perY: number | V): V {
   return hashInt3ToVec3(wrapAxis(ix, perX), wrapAxis(iy, perY), int(seed));
 }

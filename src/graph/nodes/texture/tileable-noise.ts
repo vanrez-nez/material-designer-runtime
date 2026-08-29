@@ -1,5 +1,5 @@
 import { vec2, float, floor, max, mod } from "three/tsl";
-import type { MaterialNodeDef, MaterialValue } from "../../types";
+import type { MaterialNodeDef, MaterialValue, NodeProfileWorkloadStage } from "../../types";
 import { tileableFbm } from "../../../tsl/tileable-noise";
 import { blenderFbm } from "../../../tsl/blender-noise";
 import {
@@ -10,15 +10,81 @@ import {
   paperBase01,
   woolBase01,
   stoneBase01,
+  stoneAnalyticBase01,
   gaborValue2D,
   simplexBase01,
   waveletBase01,
   erosionBase01,
+  erosionAnalyticBase01,
   curlVec,
   type NoiseBase01,
 } from "../../../tsl/noise";
 
 type V = MaterialValue;
+
+function tileableNoiseWorkload(params: Record<string, unknown>) {
+  const noiseType = (params.noiseType as string) ?? "perlin-fbm";
+  const preset = (params.preset as string) ?? "none";
+  const effective = noiseType === "perlin-fbm" && preset !== "none" ? preset : noiseType;
+  const octaves = Math.max(1, Math.min(8, Math.round(Number(params.octaves ?? 4))));
+  const rawTile = params.tileSize;
+  const configuredTileSize =
+    typeof rawTile === "string" && rawTile !== "off" && Number.isFinite(Number(rawTile))
+      ? Number(rawTile)
+      : undefined;
+  const stage = (name: string, iterations: number, primitive: string, perIteration: number) => ({
+    name,
+    iterations,
+    primitive,
+    primitiveEvaluations: iterations * perIteration,
+  });
+
+  let stages: NodeProfileWorkloadStage[];
+  switch (effective) {
+    case "curl":
+      stages = [stage("finite-difference curl", 1, "periodic-perlin", 4)];
+      break;
+    case "paper":
+    case "wool":
+      stages = [stage(`${effective} fBm`, octaves, "periodic-perlin", 4)];
+      break;
+    case "stone":
+    case "erosion":
+      stages = [stage(`${effective} fBm`, octaves, "periodic-perlin", 5)];
+      break;
+    case "stone-analytic":
+    case "erosion-analytic":
+      stages = [stage(`${effective} fBm`, octaves, "periodic-perlin", 2)];
+      break;
+    case "value":
+      stages = [stage("value fBm", octaves, "pcg-cell-hash", 4)];
+      break;
+    case "worley":
+    case "voronoi-smooth":
+      stages = [stage(`${effective} fBm`, octaves, "pcg-cell-hash", 9)];
+      break;
+    case "simplex":
+      stages = [stage("simplex fBm", octaves, "simplex-corner", 3)];
+      break;
+    case "wavelet":
+      stages = [stage("wavelet fBm", octaves, "pcg-cell-hash", 1)];
+      break;
+    case "gabor":
+      stages = [stage("3x3 cells x 8 impulses", 72, "pcg-cell-hash", 2)];
+      break;
+    default:
+      stages = [stage("perlin fBm", octaves, "periodic-perlin", 1)];
+      break;
+  }
+
+  return {
+    kernel: effective,
+    scope: "raw-isolated-node" as const,
+    ...(configuredTileSize ? { configuredTileSize } : {}),
+    stages,
+    totalPrimitiveEvaluations: stages.reduce((total, item) => total + item.primitiveEvaluations, 0),
+  };
+}
 
 // The genuine, irreducible noise ALGORITHMS selectable on this node — each a distinct generative primitive.
 // "perlin-fbm" is the DEFAULT and reproduces the original Tileable Noise output verbatim. The rest are
@@ -30,7 +96,16 @@ type V = MaterialValue;
 // selection to the existing composition via effType, so the composed looks are reproduced verbatim.
 const ALGORITHM_TYPES = ["perlin-fbm", "value", "worley", "voronoi-smooth", "gabor", "simplex", "wavelet"];
 // Perlin compositions, exposed as presets when the algorithm is perlin-fbm. "none" = raw Perlin fBm.
-const PRESET_TYPES = ["none", "curl", "paper", "wool", "stone", "erosion"];
+const PRESET_TYPES = [
+  "none",
+  "curl",
+  "paper",
+  "wool",
+  "stone",
+  "stone-analytic",
+  "erosion",
+  "erosion-analytic",
+];
 
 // Context-sensitive controls per noiseType: which OPTIONAL param keys actually take effect (see paramsFor).
 // `noiseType` + `scale` are always shown. fBm types (perlin/value/cellular/flow/simplex/wavelet/erosion) share
@@ -44,11 +119,13 @@ const NOISE_CAPS: Record<string, string[]> = {
   worley: FBM_CAPS,
   "voronoi-smooth": FBM_CAPS,
   stone: FBM_CAPS,
+  "stone-analytic": FBM_CAPS,
   paper: FBM_CAPS,
   wool: FBM_CAPS,
   simplex: FBM_CAPS,
   wavelet: FBM_CAPS,
   erosion: FBM_CAPS,
+  "erosion-analytic": FBM_CAPS,
   gabor: ["gaborFreq", "gaborAniso", "gaborOrient", "tileSize"],
   curl: [],
 };
@@ -62,10 +139,12 @@ const OFFLINE_BASES: Record<string, NoiseBase01> = {
   // NOTE: gabor is NOT here — it's sparse Gabor convolution with its own frequency/anisotropy/orientation
   // controls (not an fBm base), special-cased in build() like curl/simplex. See gaborValue2D.
   stone: stoneBase01,
+  "stone-analytic": stoneAnalyticBase01,
   paper: paperBase01,
   wool: woolBase01,
   wavelet: waveletBase01,
   erosion: erosionBase01,
+  "erosion-analytic": erosionAnalyticBase01,
   // NOTE: simplex is NOT here — it needs an EVEN period (see build) so it's special-cased.
 };
 
@@ -78,7 +157,7 @@ const FIELD_AND_VECTOR = [
 
 // Tileable Noise — periodic fBm that bakes SEAMLESS in the offline backend (authored for the 2D uv tile,
 // unlike Blender's 3D noise). `scale` = base period (integer for exact tiling); `aspect` stretches the X
-// period for directional grain (perlin only); `octaves` (detail) is a build-time loop unroll; `gain`
+// period for directional grain (perlin only); `octaves` (detail) is a build-time-selected WGSL loop bound; `gain`
 // (roughness) is a live uniform. `noiseType` selects the base noise. In the LIVE backend (3D positionWorld,
 // no tiling needed) every type falls back to `blenderFbm` as an approximate preview — the offline bake is
 // the exact, type-faithful output. Cellular types (worley / voronoi-smooth) use a single square period.
@@ -151,6 +230,9 @@ export const tileableNoiseNode: MaterialNodeDef = {
     const show = new Set(["noiseType", "scale", ...caps]);
     if (noiseType === "perlin-fbm") show.add("preset"); // preset selector only under Perlin
     return tileableNoiseNode.params.filter((p) => show.has(p.key));
+  },
+  profileWorkload(params) {
+    return tileableNoiseWorkload(params);
   },
   build(ctx) {
     const coord = (ctx.inputs.coord ?? ctx.coord) as V;

@@ -194,6 +194,24 @@ export interface BuildCtx {
   tileRepeat?: number;
 }
 
+// Deterministic shader-work description used by the node profiler. These are calculated iteration/sample
+// counts from the selected node params — never guessed timing attribution. Actual compile/GPU duration stays
+// in NodeProfileRow; this metadata explains which kernel expanded into that measured pipeline.
+export interface NodeProfileWorkloadStage {
+  name: string;
+  iterations: number;
+  primitive: string;
+  primitiveEvaluations: number;
+}
+
+export interface NodeProfileWorkload {
+  kernel: string;
+  scope: "raw-isolated-node";
+  configuredTileSize?: number;
+  stages: NodeProfileWorkloadStage[];
+  totalPrimitiveEvaluations: number;
+}
+
 export interface MaterialNodeDef {
   type: string;
   nodeClass: NodeClass;
@@ -224,6 +242,13 @@ export interface MaterialNodeDef {
   // repeat, when its `tileSize` param is set — an individual node becomes a decomposition-cache boundary so
   // the expensive per-texel eval (noise) runs at tileSize² instead of the full grid. See compiler.ts tiling.
   bakeTileable?: boolean;
+  // Optional profiler-only workload calculation. It describes the code selected for one output without
+  // executing or timing it; the profiler combines it with measured pipeline/GPU time and generated WGSL size.
+  profileWorkload?(
+    params: Record<string, unknown>,
+    outputKey: string,
+    backend: MaterialBackend,
+  ): NodeProfileWorkload;
   // Emit one TSL node-value per output port key. The terminal `material-output` returns {} — the compiler
   // reads its connected inputs directly.
   build(ctx: BuildCtx): Record<string, MaterialValue>;

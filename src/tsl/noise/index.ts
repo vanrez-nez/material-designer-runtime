@@ -4,8 +4,8 @@
 export { periodicFbm01, type NoiseBase01 } from "./fbm";
 export { valueBase01 } from "./value";
 export { worleyBase01, voronoiSmoothBase01 } from "./cellular";
-export { curlVec, paperBase01, woolBase01, stoneBase01 } from "./flow";
+export { curlVec, paperBase01, woolBase01, stoneBase01, stoneAnalyticBase01 } from "./flow";
 export { gaborValue2D } from "./gabor";
 export { simplexBase01 } from "./simplex";
 export { waveletBase01 } from "./wavelet";
-export { erosionBase01 } from "./erosion";
+export { erosionBase01, erosionAnalyticBase01 } from "./erosion";

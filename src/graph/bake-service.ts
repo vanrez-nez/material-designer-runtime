@@ -6,7 +6,9 @@ import {
   renderColorNodeToTarget,
   renderMaterialToTarget,
   renderCacheToTarget,
+  compileMaterialAsync,
   compileMaterialsAsync,
+  inspectMaterialShaderAsync,
   makeChannelMaterial,
   ssPoolInfo,
   configureChannelTexture,
@@ -22,8 +24,10 @@ import type { BakeTextureCache } from "../cache/bake-cache";
 import { createBakeCacheKey, type BakeCacheKey } from "../cache/key";
 import type { BakeCacheChannel, BakeCacheMetrics, BakeCacheTexels } from "../cache/types";
 import {
-  profilableNodes,
-  deriveMarginals,
+  profilableNodeOutputs,
+  profileWorkload,
+  measureNodeShaderMetrics,
+  deriveMeasuredNodeCosts,
   median,
   type NodeProfileOptions,
   type NodeProfileReport,
@@ -31,6 +35,7 @@ import {
 } from "./node-profiler";
 import type { MaterialGraphSource, MaterialValue, PbrSocket } from "./types";
 import { uniformArray } from "three/tsl";
+import { createShaderCacheBuster } from "./shader-cache-bust";
 
 // Single owner of all GPU texture baking (plan: "a single pipeline manager to bake the textures").
 // Decouples baking from any on-screen object: a material graph is baked into textures here, never by
@@ -40,6 +45,28 @@ import { uniformArray } from "three/tsl";
 
 // Minimal shape of the WebGPU queue's completion signal (three's backend type isn't exported here).
 type GPUQueueLike = { onSubmittedWorkDone?: () => Promise<void> };
+type TimestampBackendLike = {
+  trackTimestamp?: boolean;
+  getTimestampUID?: (renderContext: unknown) => string;
+  getTimestamp?: (uid: string) => number;
+  hasTimestamp?: (uid: string) => boolean;
+};
+type TimestampRendererLike = {
+  _currentRenderContext?: unknown;
+  _renderContexts?: { get: (target: RenderTarget, mrt?: unknown, callDepth?: number) => unknown };
+  _mrt?: unknown;
+  _callDepth?: number;
+};
+
+function createProfileRunId(): string {
+  const values = new Uint32Array(2);
+  if (typeof crypto !== "undefined") crypto.getRandomValues(values);
+  else {
+    values[0] = Date.now() >>> 0;
+    values[1] = Math.floor(Math.random() * 0xffffffff) >>> 0;
+  }
+  return Array.from(values, (value) => value.toString(16).padStart(8, "0")).join("");
+}
 
 const BAKE_SIZE = 1024;
 // Hard cap on a decomposition cache's pixel size. Keeps a supersampled derivative cache within the WebGPU
@@ -128,6 +155,52 @@ export interface BakeOptions {
   // Skip the persistent cache READ and bake for real. The write still happens, which is exactly what
   // "Regenerate" / rebuildCache() need: refresh the stored entry from a genuine bake.
   bypassCache?: boolean;
+  // Benchmark/diagnostic only: changes the generated WGSL identity while preserving its output, preventing
+  // Three and Chromium from reusing the previous page load's material shader/pipeline entries. Omit during
+  // normal use so production workloads retain shader reuse.
+  shaderCacheNonce?: string;
+}
+
+// Detailed wall-clock accounting for one bake-service run. Dispatch fields measure JavaScript/renderer
+// submission time; the GPU's completion time is kept separate in `gpuWaitMs`. Queue wait is deliberately
+// excluded from `generationMs` so the long-standing `totalMs` contract continues to mean work performed by
+// this run rather than time spent behind another material.
+export interface BakeTimingBreakdown {
+  queueWaitMs: number;
+  graphCompileMs: number;
+  cacheDispatchMs: number;
+  pipelineCompileMs: number;
+  channelDispatchMs: number;
+  cacheRestoreMs: number;
+  gpuWaitMs: number;
+  generationMs: number;
+}
+
+// Internal constructors are exported from this source module for deterministic unit testing, but are not
+// re-exported from the package entrypoint. Consumers use BakeReport.timings.
+export function createBakeTimingBreakdown(
+  queueWaitMs = 0,
+  values: Partial<Omit<BakeTimingBreakdown, "queueWaitMs" | "generationMs">> = {},
+): BakeTimingBreakdown {
+  const timings: BakeTimingBreakdown = {
+    queueWaitMs,
+    graphCompileMs: 0,
+    cacheDispatchMs: 0,
+    pipelineCompileMs: 0,
+    channelDispatchMs: 0,
+    cacheRestoreMs: 0,
+    gpuWaitMs: 0,
+    generationMs: 0,
+    ...values,
+  };
+  timings.generationMs =
+    timings.graphCompileMs +
+    timings.cacheDispatchMs +
+    timings.pipelineCompileMs +
+    timings.channelDispatchMs +
+    timings.cacheRestoreMs +
+    timings.gpuWaitMs;
+  return timings;
 }
 
 // Per-run bake telemetry for the editor's progress widget. Emitted as a rebuild moves through its phases;
@@ -142,6 +215,9 @@ export interface BakeReport {
   // render); 'done' = finished.
   phase: "nodes" | "shaders" | "render" | "restore" | "done";
   nodeCount: number; // graph nodes recompiled (0 for a uniform re-render)
+  resolution: number; // square output size used by this run
+  channels: BakeCacheChannel[]; // exact generated/restored outputs, including height when present
+  timings: BakeTimingBreakdown;
   compileMs: number; // graph (TSL) compile time
   texturesTotal: number; // channels being regenerated this run
   totalMs: number; // real generation time (incl. GPU); filled on 'done'
@@ -161,6 +237,9 @@ export class BakedTextureSet {
   private readonly cacheTargets = new Map<string, RenderTarget>();
   private readonly cacheMats = new Map<string, MeshBasicNodeMaterial>();
   cachePlan: CacheEntry[] = [];
+  // The optional diagnostic shader identity used to build this set. Retained so uniform-only re-renders use
+  // the same nonce-specific downsample pipeline instead of silently falling back to the production pool.
+  shaderCacheNonce: string | undefined;
   // Per-node param uniforms from the last compile (nodeId -> { paramKey -> uniform node }). The colorNodes
   // above reference these, so updating a uniform's `.value` and re-rendering reflects it with no recompile.
   uniforms: Map<string, Record<string, MaterialValue>> = new Map();
@@ -457,8 +536,9 @@ export class MaterialBakeService {
   // animate loop must skip its `renderer.render` — see app.ts. Held only during the async-compile window;
   // the synchronous bake renders that follow can't be interleaved (JS is single-threaded, no awaits).
   private compileGateDepth = 0;
+  private profileGateDepth = 0;
   get rendererBusy(): boolean {
-    return this.compileGateDepth > 0;
+    return this.compileGateDepth > 0 || this.profileGateDepth > 0;
   }
   // Serial job chain — bakes run one at a time (shared GPU quads). Each job appends to this promise.
   private queue: Promise<unknown> = Promise.resolve();
@@ -514,14 +594,15 @@ export class MaterialBakeService {
 
   // Append one unit of GPU work to the serial queue. `total` grows as jobs enqueue and both counters reset
   // when the queue fully drains, so progress reads as N-of-M across a burst then clears.
-  private enqueue<T>(label: string, job: () => T | Promise<T>): Promise<T> {
+  private enqueue<T>(label: string, job: (queueWaitMs: number) => T | Promise<T>): Promise<T> {
+    const queuedAt = performance.now();
     this.total += 1;
     this.emitProgress();
     const run = this.queue.then(async () => {
       this.active = label;
       this.emitProgress();
       try {
-        return await job();
+        return await job(performance.now() - queuedAt);
       } finally {
         this.completed += 1;
         this.active = null;
@@ -548,12 +629,13 @@ export class MaterialBakeService {
   // Render a graph's connected channels into `set`, in place (queued). Resolves true when the present
   // channel set changed since the last bake (so the caller rewires its samplers), false to just re-render.
   bakeInto(set: BakedTextureSet, graph: MaterialGraphSource, opts: BakeOptions = {}): Promise<boolean> {
-    return this.enqueue(opts.label ?? "surface", async () => {
+    return this.enqueue(opts.label ?? "surface", async (queueWaitMs) => {
       const renderer = this.renderer;
       if (!renderer) return false;
+      set.shaderCacheNonce = opts.shaderCacheNonce;
       // Try the persistent cache FIRST — ahead of compileBundle below, which is the only placement that buys
       // anything. The render is ~60-80ms; the pipeline compile it precedes is 3.6-4.6s.
-      const restored = await this.tryRestoreFromCache(renderer, set, graph, opts);
+      const restored = await this.tryRestoreFromCache(renderer, set, graph, opts, queueWaitMs);
       if (restored) return restored.changed;
       const tCompile0 = performance.now();
       // Decompose: each group's outputs are baked to their own intermediate textures (allocCache hands the
@@ -576,33 +658,45 @@ export class MaterialBakeService {
       // (multi-hundred-MB) cache re-render on every solo toggle.
       if (!opts.soloNodeId) set.pruneCaches(new Set(cachePlan.map((e) => e.cacheId)));
       const channels = opts.channels ?? set.channels;
+      const shaderCacheBuster = createShaderCacheBuster(opts.shaderCacheNonce);
+      const coldVec3 = (node: MaterialValue): MaterialValue => shaderCacheBuster?.vec3(node) ?? node;
       const present = new Set<PbrSocket>();
       // Collect channel jobs first (assigning colorNode + needsUpdate is what marks them for recompile).
-      type Job = { mat: MeshBasicNodeMaterial; target: RenderTarget; isNormal: boolean };
+      type Job = {
+        channel: BakeCacheChannel;
+        mat: MeshBasicNodeMaterial;
+        target: RenderTarget;
+        isNormal: boolean;
+      };
       const jobs: Job[] = [];
       for (const ch of channels) {
         const node = (bundle as Partial<Record<string, MaterialValue>>)[ch];
         if (!node) continue;
         const mat = set.channelMaterial(ch);
-        mat.colorNode = encodeChannel(node, ch);
+        mat.colorNode = coldVec3(encodeChannel(node, ch));
         mat.needsUpdate = true;
-        jobs.push({ mat, target: set.target(ch), isNormal: ch === "normal" });
+        jobs.push({ channel: ch, mat, target: set.target(ch), isNormal: ch === "normal" });
         present.add(ch);
       }
       // Height drives the parallax UV offset (its own linear target), not a lit channel.
       set.hasHeight = bundle.height !== undefined;
       if (set.hasHeight) {
         const hm = set.channelMaterial("height");
-        hm.colorNode = vec3(bundle.height);
+        hm.colorNode = coldVec3(vec3(bundle.height));
         hm.needsUpdate = true;
-        jobs.push({ mat: hm, target: set.ensureHeightTarget(), isNormal: false });
+        jobs.push({ channel: "height", mat: hm, target: set.ensureHeightTarget(), isNormal: false });
       }
+      const generatedChannels = jobs.map((job) => job.channel);
+      let timings = createBakeTimingBreakdown(queueWaitMs, { graphCompileMs: compileMs });
       // Telemetry base for this run; phase/totalMs are filled as we go.
       const report: BakeReport = {
         runId: ++this.bakeRunId,
         source: opts.source,
         phase: "nodes",
         nodeCount,
+        resolution: set.size,
+        channels: generatedChannels,
+        timings,
         compileMs,
         texturesTotal: jobs.length,
         totalMs: 0,
@@ -611,9 +705,10 @@ export class MaterialBakeService {
       // Render the decomposition caches (bottom-up) BEFORE the channels sample them. Each is a small
       // single-group shader, compiled synchronously here (fast) — the whole point is that no channel inlines
       // the graph. Synchronous, so no render-gate needed (nothing can interleave).
+      const tCacheDispatch0 = performance.now();
       for (const entry of cachePlan) {
         const cm = set.cacheMaterial(entry.cacheId);
-        cm.colorNode = entry.colorNode;
+        cm.colorNode = coldVec3(entry.colorNode);
         cm.needsUpdate = true;
         renderCacheToTarget(
           renderer,
@@ -621,12 +716,17 @@ export class MaterialBakeService {
           set.cacheTarget(entry.cacheId, cacheSizeFor(set.size, entry.sizing), cacheWantsMips(entry.sizing)),
         );
       }
+      const cacheDispatchMs = performance.now() - tCacheDispatch0;
+      timings = createBakeTimingBreakdown(queueWaitMs, {
+        graphCompileMs: compileMs,
+        cacheDispatchMs,
+      });
       let precompileMs = 0;
       if (ASYNC_PIPELINE_COMPILE) {
         // Three r184 processes compileAsync work items sequentially, yielding between them. This keeps the
         // editor responsive but is not channel-parallel compilation. The gate still protects Three's shared
         // renderer state throughout that asynchronous window.
-        this.emitReport({ ...report, phase: "shaders" }); // pipelines compiling (the dominant phase)
+        this.emitReport({ ...report, phase: "shaders", timings }); // pipelines compiling (the dominant phase)
         const tPrecompile0 = performance.now();
         this.compileGateDepth += 1;
         try {
@@ -634,6 +734,7 @@ export class MaterialBakeService {
             renderer,
             jobs.map((j) => j.mat),
             set.size,
+            opts.shaderCacheNonce,
           );
         } finally {
           this.compileGateDepth -= 1;
@@ -644,7 +745,8 @@ export class MaterialBakeService {
       // SYNCHRONOUSLY here on first draw (no off-thread option on those browsers — a single compile, never a
       // gate or a double-compile).
       const tDispatch0 = performance.now();
-      for (const j of jobs) renderMaterialToTarget(renderer, j.mat, j.target, j.isNormal);
+      for (const j of jobs)
+        renderMaterialToTarget(renderer, j.mat, j.target, j.isNormal, opts.shaderCacheNonce);
       const dispatchMs = performance.now() - tDispatch0;
       const changed = set.setPresence(present, set.hasHeight);
       // Wait for the GPU to actually finish before resolving — gives the caller real back-pressure so it
@@ -653,8 +755,15 @@ export class MaterialBakeService {
       await this.gpuSync(set.firstTarget());
       const gpuWaitMs = performance.now() - tGpu0;
       // Real generation time the widget reports = compile + shader-compile + render + GPU completion.
-      const totalMs = compileMs + precompileMs + dispatchMs + gpuWaitMs;
-      this.emitReport({ ...report, phase: "done", totalMs });
+      timings = createBakeTimingBreakdown(queueWaitMs, {
+        graphCompileMs: compileMs,
+        cacheDispatchMs,
+        pipelineCompileMs: precompileMs,
+        channelDispatchMs: dispatchMs,
+        gpuWaitMs,
+      });
+      const totalMs = timings.generationMs;
+      this.emitReport({ ...report, phase: "done", timings, totalMs });
       if (BAKE_PROFILE) {
         // precompile = async (non-blocking, render-gated) pipeline compile via compileAsync; dispatch =
         // warm render calls; gpuWait = wall time to GPU completion. The heavy time sits in the gated
@@ -692,6 +801,7 @@ export class MaterialBakeService {
   // — the fast path for slider drags. Serialised after any in-flight bake (shared GPU quads); no progress
   // counter (this isn't a "bake" the UI should report).
   rerenderInto(set: BakedTextureSet, source?: string): Promise<void> {
+    const queuedAt = performance.now();
     const run = this.queue.then(async () => {
       const renderer = this.renderer;
       if (!renderer) return;
@@ -702,20 +812,26 @@ export class MaterialBakeService {
       if (set.restored) return;
       const total = set.present.size + (set.hasHeight && set.heightTarget ? 1 : 0);
       // Uniform re-render: no recompile (nodeCount 0), only the channel renders are regenerated.
+      const queueWaitMs = performance.now() - queuedAt;
+      const generatedChannels: BakeCacheChannel[] = [...set.present];
+      if (set.hasHeight && set.heightTarget) generatedChannels.push("height");
       const report: BakeReport = {
         runId: ++this.bakeRunId,
         source,
         phase: "render",
         nodeCount: 0,
+        resolution: set.size,
+        channels: generatedChannels,
+        timings: createBakeTimingBreakdown(queueWaitMs),
         compileMs: 0,
         texturesTotal: total,
         totalMs: 0,
       };
       this.emitReport(report); // run started
-      const tDispatch0 = performance.now();
       // Regenerate the decomposition caches first (bottom-up), reusing their pipelines: a uniform edit inside
       // a group changed a uniform the cache material references, so the cache — and thus every channel that
       // samples it — must be re-rendered. No recompile (colorNode unchanged), just new uniform values.
+      const tCacheDispatch0 = performance.now();
       for (const entry of set.cachePlan) {
         renderCacheToTarget(
           renderer,
@@ -723,18 +839,37 @@ export class MaterialBakeService {
           set.cacheTarget(entry.cacheId, cacheSizeFor(set.size, entry.sizing), cacheWantsMips(entry.sizing)),
         );
       }
+      const cacheDispatchMs = performance.now() - tCacheDispatch0;
+      const tChannelDispatch0 = performance.now();
       for (const ch of set.present) {
-        renderMaterialToTarget(renderer, set.channelMaterial(ch), set.target(ch), ch === "normal");
+        renderMaterialToTarget(
+          renderer,
+          set.channelMaterial(ch),
+          set.target(ch),
+          ch === "normal",
+          set.shaderCacheNonce,
+        );
       }
       if (set.hasHeight && set.heightTarget) {
-        renderMaterialToTarget(renderer, set.channelMaterial("height"), set.heightTarget, false);
+        renderMaterialToTarget(
+          renderer,
+          set.channelMaterial("height"),
+          set.heightTarget,
+          false,
+          set.shaderCacheNonce,
+        );
       }
-      const dispatchMs = performance.now() - tDispatch0;
+      const dispatchMs = performance.now() - tChannelDispatch0;
       // Baseline path (no recompile): same channels re-rendered, reusing existing pipelines.
       const tGpu0 = performance.now();
       await this.gpuSync(set.firstTarget()); // back-pressure: resolve only after the GPU finishes (see bakeInto)
       const gpuWaitMs = performance.now() - tGpu0;
-      this.emitReport({ ...report, phase: "done", totalMs: dispatchMs + gpuWaitMs });
+      const timings = createBakeTimingBreakdown(queueWaitMs, {
+        cacheDispatchMs,
+        channelDispatchMs: dispatchMs,
+        gpuWaitMs,
+      });
+      this.emitReport({ ...report, phase: "done", timings, totalMs: timings.generationMs });
       if (BAKE_PROFILE) {
         console.log(
           `[bake-prof] rerender dispatch=${dispatchMs.toFixed(1)} gpuWait=${gpuWaitMs.toFixed(1)}ms`,
@@ -860,6 +995,7 @@ export class MaterialBakeService {
     set: BakedTextureSet,
     graph: MaterialGraphSource,
     opts: BakeOptions,
+    queueWaitMs: number,
   ): Promise<{ changed: boolean } | null> {
     const cache = this.cache_;
     // A solo bake is a transient preview and deliberately omits the group caches — never cache or restore it.
@@ -900,11 +1036,17 @@ export class MaterialBakeService {
         writeTargetTexels(renderer, set.target(texels.channel), texels.bytes);
         present.add(texels.channel);
       }
+      const channels = entry.textures.map((texels) => texels.channel);
+      const cacheRestoreMs = performance.now() - t0;
+      let timings = createBakeTimingBreakdown(queueWaitMs, { cacheRestoreMs });
       const report: BakeReport = {
         runId: ++this.bakeRunId,
         source: opts.source,
         phase: "restore",
         nodeCount: 0,
+        resolution: set.size,
+        channels,
+        timings,
         compileMs: 0,
         texturesTotal: entry.textures.length,
         totalMs: 0,
@@ -915,9 +1057,12 @@ export class MaterialBakeService {
       set.contentStamp += 1;
       // Same back-pressure contract as a bake: resolve only once the GPU has actually finished, so the caller
       // can't submit a frame that samples a half-copied texture.
+      const tGpu0 = performance.now();
       await this.gpuSync(set.firstTarget());
-      const totalMs = performance.now() - t0;
-      this.emitReport({ ...report, phase: "done", totalMs });
+      const gpuWaitMs = performance.now() - tGpu0;
+      timings = createBakeTimingBreakdown(queueWaitMs, { cacheRestoreMs, gpuWaitMs });
+      const totalMs = timings.generationMs;
+      this.emitReport({ ...report, phase: "done", timings, totalMs });
       if (BAKE_PROFILE) {
         console.log(
           `[bake-prof] restore channels=${entry.textures.length} bytes=${entry.bytes} ` +
@@ -1055,72 +1200,335 @@ export class MaterialBakeService {
   }
 
   // Per-node cost profiling (dev tool — see node-profiler.ts for what "per node" honestly means). Each
-  // profilable node's subtree is solo-compiled and rendered in isolation into the pooled scratch target:
-  // one cold render (TSL build + pipeline compile + first draw → pipelineMs), then `runs` warm re-renders,
-  // each awaited with real GPU back-pressure, medianed → renderMs. A constant-color render measured first
-  // gives the floor (`overheadMs`) that every renderMs includes. Serialised on the bake queue — the
-  // channel-baker's quads are shared, and a profile must not interleave with a live bake.
+  // profilable node's subtree is solo-built and compiled in isolation, then warm-rendered `runs` times.
+  // Pipeline compilation is wall-clocked around compileAsync (GPU timestamps cannot see browser compiler
+  // work); render-pass execution uses timestamp-query. Every output is measured as: real isolated node minus
+  // its matched neutral-input baseline. Real ancestor-subtree totals are retained separately as context.
+  // A nonce in the actual WGSL prevents a prior page/profile run from making compile measurements warm.
   profileNodes(graph: MaterialGraphSource, opts: NodeProfileOptions = {}): Promise<NodeProfileReport> {
     const size = Math.max(64, Math.min(2048, opts.size ?? 512));
     const runs = Math.max(1, Math.min(32, opts.runs ?? 6));
+    const compileRuns = Math.max(1, Math.min(5, opts.compileRuns ?? 3));
     return this.enqueue("profile", async () => {
+      this.profileGateDepth += 1;
+      const profileRunId = createProfileRunId();
       const renderer = this.renderer;
-      const report: NodeProfileReport = { size, runs, overheadMs: 0, nodes: [] };
-      if (!renderer) return report;
-      const rt = this.scratchTarget(size);
-      const doc = graph.document;
-
-      // One cold+warm measurement of an already-assigned material; the caller owns colorNode/needsUpdate.
-      const measure = async (mat: MeshBasicNodeMaterial): Promise<{ pipelineMs: number; renderMs: number }> => {
-        const t0 = performance.now();
-        renderCacheToTarget(renderer, mat, rt);
-        await this.gpuSync(rt);
-        const pipelineMs = performance.now() - t0;
-        const samples: number[] = [];
-        for (let i = 0; i < runs; i++) {
-          const t = performance.now();
-          renderCacheToTarget(renderer, mat, rt);
-          await this.gpuSync(rt);
-          samples.push(performance.now() - t);
+      const timestampBackend = renderer?.backend as unknown as TimestampBackendLike | undefined;
+      let timestampQuerySupported = false;
+      let timestampTrackingEnabled = false;
+      const previousTimestampTracking = timestampBackend?.trackTimestamp === true;
+      if (renderer) {
+        try {
+          timestampQuerySupported = renderer.hasFeature("timestamp-query");
+        } catch {
+          timestampQuerySupported = false;
         }
-        return { pipelineMs, renderMs: median(samples) };
+        // The renderer requests the optional timestamp-query device feature at initialization. Keep query
+        // allocation scoped to this operation so a normal animation loop cannot exhaust Three's fixed pool.
+        if (timestampQuerySupported && timestampBackend) {
+          timestampTrackingEnabled = true;
+          timestampBackend.trackTimestamp = true;
+        }
+      }
+      const report: NodeProfileReport = {
+        size,
+        runs,
+        compileRuns,
+        profileRunId,
+        measurementMode: "isolated-node-minus-matched-baseline",
+        timingMode: timestampTrackingEnabled ? "timestamp-query" : "wall-clock-fallback",
+        timestampScope:
+          timestampTrackingEnabled &&
+          typeof timestampBackend?.getTimestampUID === "function" &&
+          typeof timestampBackend?.getTimestamp === "function"
+            ? "render-context"
+            : timestampTrackingEnabled
+              ? "aggregate-frame"
+              : "unavailable",
+        timestampQuerySupported,
+        timestampTrackingEnabled,
+        overheadMs: 0,
+        compileOverheadMs: 0,
+        nodes: [],
       };
 
-      const floorMat = makeChannelMaterial();
-      floorMat.colorNode = vec3(0.5, 0.5, 0.5);
-      floorMat.needsUpdate = true;
-      report.overheadMs = (await measure(floorMat)).renderMs;
-      floorMat.dispose();
+      try {
+        if (!renderer) return report;
+        const rt = this.scratchTarget(size);
+        const doc = graph.document;
 
-      for (const node of profilableNodes(doc, graph.getRegistry(), opts.nodeIds)) {
-        const row: NodeProfileRow = {
-          nodeId: node.id, type: node.type, label: node.label, pipelineMs: 0, renderMs: 0, marginalMs: 0,
+        // Clear timestamp records left by any work submitted before the profile gate closed. Each subsequent
+        // resolve then contains exactly one isolated fullscreen render pass.
+        if (timestampTrackingEnabled) {
+          await renderer.resolveTimestampsAsync(THREE.TimestampQuery.RENDER);
+        }
+
+        const gpuSample = async (mat: MeshBasicNodeMaterial): Promise<number> => {
+          if (timestampTrackingEnabled) {
+            renderCacheToTarget(renderer, mat, rt);
+            // Three's public resolveTimestampsAsync() returns the total for the last tracked frame. A preview
+            // render submitted by the host between profile awaits can therefore contaminate that aggregate.
+            // Capture this pass's render-context UID synchronously, resolve the pool for back-pressure, then
+            // read only this context's duration from the backend timestamp map.
+            const internalRenderer = renderer as unknown as TimestampRendererLike;
+            const renderContext =
+              internalRenderer._currentRenderContext ??
+              internalRenderer._renderContexts?.get(
+                rt,
+                internalRenderer._mrt,
+                // Renderer._renderScene increments before acquiring the context, then decrements before
+                // returning. We are immediately after QuadMesh.render(), so the just-used key is depth + 1.
+                (internalRenderer._callDepth ?? -1) + 1,
+              );
+            const timestampUid =
+              renderContext != null ? timestampBackend?.getTimestampUID?.(renderContext) : undefined;
+            const duration = await renderer.resolveTimestampsAsync(THREE.TimestampQuery.RENDER);
+            if (
+              timestampUid &&
+              timestampBackend?.hasTimestamp?.(timestampUid) !== false &&
+              typeof timestampBackend?.getTimestamp === "function"
+            ) {
+              const contextDuration = timestampBackend.getTimestamp(timestampUid);
+              if (Number.isFinite(contextDuration)) return contextDuration;
+            }
+            const infoDuration = renderer.info.render.timestamp;
+            if (typeof infoDuration === "number" && Number.isFinite(infoDuration)) return infoDuration;
+            return typeof duration === "number" && Number.isFinite(duration) ? duration : 0;
+          }
+          const startedAt = performance.now();
+          renderCacheToTarget(renderer, mat, rt);
+          await this.gpuSync(rt);
+          return performance.now() - startedAt;
         };
-        report.nodes.push(row);
-        let colorNode: MaterialValue | undefined;
-        try {
-          const { bundle } = graph.compileBundle({ backend: "offline", soloNodeId: node.id });
-          colorNode = (bundle as Partial<Record<string, MaterialValue>>).baseColor;
-        } catch (err) {
-          row.error = err instanceof Error ? err.message : String(err);
-          continue;
-        }
-        if (!colorNode) {
-          row.error = "no solo output";
-          continue;
-        }
-        const mat = makeChannelMaterial();
-        mat.colorNode = colorNode;
-        mat.needsUpdate = true;
-        const m = await measure(mat);
-        mat.dispose(); // frees this subtree's one-off pipeline instead of pinning it in the renderer cache
-        row.pipelineMs = m.pipelineMs;
-        row.renderMs = m.renderMs;
-      }
 
-      deriveMarginals(report.nodes, doc, report.overheadMs);
-      report.nodes.sort((a, b) => b.renderMs - a.renderMs);
-      return report;
+        type PreparedProfileMaterial = {
+          material: MeshBasicNodeMaterial;
+          pipelineCompileMs: number;
+          fragmentShader: string;
+        };
+
+        // Compile the same expression through independently cache-busted materials and retain the last one.
+        // Keeping preparation separate from sampling lets real/baseline GPU passes be interleaved; otherwise
+        // GPU frequency or background-load drift between two separate sample blocks can reverse the delta.
+        const prepare = async (
+          colorNode: MaterialValue,
+          identity: string,
+        ): Promise<PreparedProfileMaterial> => {
+          const compileSamples: number[] = [];
+          let measuredMaterial: MeshBasicNodeMaterial | null = null;
+          try {
+            for (let index = 0; index < compileRuns; index += 1) {
+              const mat = makeChannelMaterial();
+              const buster = createShaderCacheBuster(`${profileRunId}_${identity}_${index}`)!;
+              mat.colorNode = buster.vec3(colorNode);
+              mat.needsUpdate = true;
+              if (measuredMaterial) measuredMaterial.dispose();
+              measuredMaterial = mat;
+              const compileStartedAt = performance.now();
+              await compileMaterialAsync(renderer, mat, rt);
+              compileSamples.push(performance.now() - compileStartedAt);
+            }
+            const { fragmentShader } = await inspectMaterialShaderAsync(renderer, measuredMaterial!, rt);
+            return {
+              material: measuredMaterial!,
+              pipelineCompileMs: median(compileSamples),
+              fragmentShader,
+            };
+          } catch (error) {
+            measuredMaterial?.dispose();
+            throw error;
+          }
+        };
+
+        // Independent total used for the constant floor and real-subtree context columns.
+        const measure = async (
+          colorNode: MaterialValue,
+          identity: string,
+        ): Promise<{ pipelineCompileMs: number; gpuMs: number; fragmentShader: string }> => {
+          const prepared = await prepare(colorNode, identity);
+          try {
+            await gpuSample(prepared.material);
+            const gpuSamples: number[] = [];
+            for (let index = 0; index < runs; index += 1) {
+              gpuSamples.push(await gpuSample(prepared.material));
+            }
+            return {
+              pipelineCompileMs: prepared.pipelineCompileMs,
+              gpuMs: median(gpuSamples),
+              fragmentShader: prepared.fragmentShader,
+            };
+          } finally {
+            prepared.material.dispose();
+          }
+        };
+
+        // Real node and matched neutral baseline are sampled as adjacent pairs, alternating order each run.
+        // The public gpuMs is derived from the median of these signed pair deltas, not from two drifting
+        // independent medians. Raw isolated/baseline medians remain visible for inspection.
+        const measurePair = async (
+          isolatedNode: MaterialValue,
+          baselineNode: MaterialValue,
+          identity: string,
+        ): Promise<{
+          isolated: { pipelineCompileMs: number; gpuMs: number; fragmentShader: string };
+          baseline: { pipelineCompileMs: number; gpuMs: number; fragmentShader: string };
+          gpuPairedDeltaMs: number;
+        }> => {
+          const isolated = await prepare(isolatedNode, `${identity}_isolated`);
+          let baseline: PreparedProfileMaterial | null = null;
+          try {
+            baseline = await prepare(baselineNode, `${identity}_baseline`);
+            await gpuSample(baseline.material);
+            await gpuSample(isolated.material);
+            const isolatedSamples: number[] = [];
+            const baselineSamples: number[] = [];
+            const deltaSamples: number[] = [];
+            for (let index = 0; index < runs; index += 1) {
+              let isolatedMs: number;
+              let baselineMs: number;
+              if (index % 2 === 0) {
+                baselineMs = await gpuSample(baseline.material);
+                isolatedMs = await gpuSample(isolated.material);
+              } else {
+                isolatedMs = await gpuSample(isolated.material);
+                baselineMs = await gpuSample(baseline.material);
+              }
+              isolatedSamples.push(isolatedMs);
+              baselineSamples.push(baselineMs);
+              deltaSamples.push(isolatedMs - baselineMs);
+            }
+            return {
+              isolated: {
+                pipelineCompileMs: isolated.pipelineCompileMs,
+                gpuMs: median(isolatedSamples),
+                fragmentShader: isolated.fragmentShader,
+              },
+              baseline: {
+                pipelineCompileMs: baseline.pipelineCompileMs,
+                gpuMs: median(baselineSamples),
+                fragmentShader: baseline.fragmentShader,
+              },
+              gpuPairedDeltaMs: median(deltaSamples),
+            };
+          } finally {
+            isolated.material.dispose();
+            baseline?.material.dispose();
+          }
+        };
+
+        const floor = await measure(vec3(0.5, 0.5, 0.5), "floor");
+        report.overheadMs = floor.gpuMs;
+        report.compileOverheadMs = floor.pipelineCompileMs;
+
+        for (const { node, output, hasConnectedInputs } of profilableNodeOutputs(
+          doc,
+          graph.getRegistry(),
+          opts.nodeIds,
+        )) {
+          const row: NodeProfileRow = {
+            nodeId: node.id,
+            type: node.type,
+            label: node.label,
+            outputKey: output.key,
+            outputLabel: output.label,
+            outputKind: output.kind,
+            graphCompileMs: 0,
+            isolatedGraphCompileMs: 0,
+            subtreeCompileMs: 0,
+            subtreeGpuMs: 0,
+            isolatedCompileMs: 0,
+            isolatedGpuMs: 0,
+            baselineCompileMs: 0,
+            baselineGpuMs: 0,
+            compileMs: 0,
+            gpuMs: 0,
+            workload: profileWorkload(node, output, graph.getRegistry()),
+          };
+          report.nodes.push(row);
+          let subtreeNode: MaterialValue | undefined;
+          let isolatedNode: MaterialValue | undefined;
+          let baselineNode: MaterialValue | undefined;
+          const identity = `${node.id}_${output.key}`;
+          try {
+            const graphStartedAt = performance.now();
+            const { bundle } = graph.compileBundle({
+              backend: "offline",
+              soloNodeId: node.id,
+              soloOutputKey: output.key,
+            });
+            row.graphCompileMs = performance.now() - graphStartedAt;
+            subtreeNode = (bundle as Partial<Record<string, MaterialValue>>).baseColor;
+
+            if (hasConnectedInputs) {
+              const isolatedStartedAt = performance.now();
+              const isolated = graph.compileBundle({
+                backend: "offline",
+                soloNodeId: node.id,
+                soloOutputKey: output.key,
+                isolateSoloNodeInputs: true,
+              });
+              row.isolatedGraphCompileMs = performance.now() - isolatedStartedAt;
+              isolatedNode = (isolated.bundle as Partial<Record<string, MaterialValue>>).baseColor;
+
+              const baseline = graph.compileBundle({
+                backend: "offline",
+                soloNodeId: node.id,
+                soloOutputKey: output.key,
+                isolateSoloNodeInputs: true,
+                soloDependencyBaseline: true,
+              });
+              baselineNode = (baseline.bundle as Partial<Record<string, MaterialValue>>).baseColor;
+            } else {
+              row.isolatedGraphCompileMs = row.graphCompileMs;
+              isolatedNode = subtreeNode;
+            }
+          } catch (err) {
+            row.error = err instanceof Error ? err.message : String(err);
+            continue;
+          }
+          if (!subtreeNode || !isolatedNode || (hasConnectedInputs && !baselineNode)) {
+            row.error = `no solo output '${output.key}'`;
+            continue;
+          }
+          try {
+            const subtree = await measure(subtreeNode, `${identity}_subtree`);
+            row.subtreeCompileMs = subtree.pipelineCompileMs;
+            row.subtreeGpuMs = subtree.gpuMs;
+            const pair = await measurePair(
+              isolatedNode,
+              baselineNode ?? vec3(0.5, 0.5, 0.5),
+              identity,
+            );
+            row.isolatedCompileMs = pair.isolated.pipelineCompileMs;
+            row.isolatedGpuMs = pair.isolated.gpuMs;
+            row.baselineCompileMs = pair.baseline.pipelineCompileMs;
+            row.baselineGpuMs = pair.baseline.gpuMs;
+            row.gpuPairedDeltaMs = pair.gpuPairedDeltaMs;
+            row.shaderMetrics = measureNodeShaderMetrics(
+              pair.isolated.fragmentShader,
+              pair.baseline.fragmentShader,
+            );
+          } catch (err) {
+            row.error = err instanceof Error ? err.message : String(err);
+          }
+        }
+
+        deriveMeasuredNodeCosts(report.nodes);
+        report.nodes.sort((a, b) => b.compileMs - a.compileMs || b.gpuMs - a.gpuMs);
+        return report;
+      } finally {
+        // Flush while tracking is still enabled, then restore the caller's setting. Every measured pass is
+        // already resolved individually; this also clears a pending pass if profiling threw midway through.
+        if (renderer && timestampTrackingEnabled) {
+          try {
+            await renderer.resolveTimestampsAsync(THREE.TimestampQuery.RENDER);
+          } catch {
+            // Preserve the original profiling error (if any); timestamp cleanup is best effort.
+          }
+        }
+        if (timestampBackend) timestampBackend.trackTimestamp = previousTimestampTracking;
+        this.profileGateDepth -= 1;
+      }
     });
   }
 

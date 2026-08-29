@@ -1,4 +1,4 @@
-import { Fn, float, int, vec3, floor, select, max, mix, smoothstep, pow } from "three/tsl";
+import { Fn, Loop, float, int, vec2, vec3, floor, select, max, mix, smoothstep, pow } from "three/tsl";
 import type { MaterialValue } from "../graph/types";
 
 // Faithful TSL port of Blender's Voronoi — plan L4 / decision 2. Transcribed verbatim from Blender GPU
@@ -10,6 +10,11 @@ import type { MaterialValue } from "../graph/types";
 // Metrics: 0 Euclidean, 1 Manhattan, 2 Chebychev, 3 Minkowski (uses the exponent). Features expose
 // Distance/Color/Position (each output re-runs the loop; only connected outputs compile).
 type V = MaterialValue;
+type NamedLoop = (
+  params: { start: number; end: V; name: string; condition: "<" | "<=" },
+  body: (variables: Record<string, V>) => void,
+) => void;
+const namedLoop = Loop as unknown as NamedLoop;
 const INV_2147483648 = 1 / 0x80000000; // float(0x7fffffff) rounds to 2147483648 in f32 — match Blender.
 
 function hashInt3ToVec3(kx: V, ky: V, kz: V): V {
@@ -75,9 +80,9 @@ function voronoiF1(coord: V, randomness: V, metric: number, exponent: V, want: W
     const minDist = float(1e10).toVar();
     const tOff = vec3(0, 0, 0).toVar();
     const tPos = vec3(0, 0, 0).toVar();
-    for (let k = -1; k <= 1; k++)
-      for (let j = -1; j <= 1; j++)
-        for (let i = -1; i <= 1; i++) {
+    namedLoop({ start: -1, end: int(1), name: "k", condition: "<=" }, ({ k }) => {
+      namedLoop({ start: -1, end: int(1), name: "j", condition: "<=" }, ({ j }) => {
+        namedLoop({ start: -1, end: int(1), name: "i", condition: "<=" }, ({ i }) => {
           const off = vec3(i, j, k);
           const pp = off.add(cellHash(cx.add(i), cy.add(j), cz.add(k), period).mul(randomness));
           const d = voronoiDistance(pp, local, metric, exponent);
@@ -85,7 +90,9 @@ function voronoiF1(coord: V, randomness: V, metric: number, exponent: V, want: W
           minDist.assign(closer.select(d, minDist));
           tOff.assign(closer.select(off, tOff));
           tPos.assign(closer.select(pp, tPos));
-        }
+        });
+      });
+    });
     if (want === "color")
       return cellHash(cx.add(int(tOff.x)), cy.add(int(tOff.y)), cz.add(int(tOff.z)), period);
     if (want === "position") return tPos.add(cell);
@@ -107,9 +114,9 @@ function voronoiF2(coord: V, randomness: V, metric: number, exponent: V, want: W
     const offF2 = vec3(0, 0, 0).toVar();
     const posF1 = vec3(0, 0, 0).toVar();
     const posF2 = vec3(0, 0, 0).toVar();
-    for (let k = -1; k <= 1; k++)
-      for (let j = -1; j <= 1; j++)
-        for (let i = -1; i <= 1; i++) {
+    namedLoop({ start: -1, end: int(1), name: "k", condition: "<=" }, ({ k }) => {
+      namedLoop({ start: -1, end: int(1), name: "j", condition: "<=" }, ({ j }) => {
+        namedLoop({ start: -1, end: int(1), name: "i", condition: "<=" }, ({ i }) => {
           const off = vec3(i, j, k);
           const pp = off.add(cellHash(cx.add(i), cy.add(j), cz.add(k), period).mul(randomness));
           const d = voronoiDistance(pp, local, metric, exponent);
@@ -132,7 +139,9 @@ function voronoiF2(coord: V, randomness: V, metric: number, exponent: V, want: W
           dF1.assign(nDF1);
           offF1.assign(nOffF1);
           posF1.assign(nPosF1);
-        }
+        });
+      });
+    });
     if (want === "color")
       return cellHash(cx.add(int(offF2.x)), cy.add(int(offF2.y)), cz.add(int(offF2.z)), period);
     if (want === "position") return posF2.add(cell);
@@ -143,7 +152,7 @@ function voronoiF2(coord: V, randomness: V, metric: number, exponent: V, want: W
 // Smooth F1: smooth-minimum blend (smoothness param). Stateful accumulation of distance/color/pos.
 // GPU-SAFETY: Blender's reference uses a 5×5×5 (125-tap) neighbourhood, but at the offline bake's 4×
 // supersample that overruns the GPU and triggers a device loss (it took out the whole context once). The
-// loop is build-time, so it can't shrink with the smoothness uniform — instead it's fixed at 3×3×3 (27-tap,
+// loop bound is structural, so it can't shrink with the smoothness uniform — instead it's fixed at 3×3×3 (27-tap,
 // the same cost as F1/F2, which are proven safe). For the smoothness range this node exposes (0–1, the
 // soft-min weight of a cell ≥2 units away is ~0 once `0.5 + (smoothD−d)·0.5/sm` clamps below 0), the outer
 // ring contributes negligibly, so the result is visually equivalent to the 125-tap version.
@@ -168,9 +177,9 @@ function voronoiSmoothF1(
     const smoothC = vec3(0, 0, 0).toVar();
     const smoothP = vec3(0, 0, 0).toVar();
     const h = float(-1).toVar();
-    for (let k = -SMOOTH_RADIUS; k <= SMOOTH_RADIUS; k++)
-      for (let j = -SMOOTH_RADIUS; j <= SMOOTH_RADIUS; j++)
-        for (let i = -SMOOTH_RADIUS; i <= SMOOTH_RADIUS; i++) {
+    namedLoop({ start: -SMOOTH_RADIUS, end: int(SMOOTH_RADIUS), name: "k", condition: "<=" }, ({ k }) => {
+      namedLoop({ start: -SMOOTH_RADIUS, end: int(SMOOTH_RADIUS), name: "j", condition: "<=" }, ({ j }) => {
+        namedLoop({ start: -SMOOTH_RADIUS, end: int(SMOOTH_RADIUS), name: "i", condition: "<=" }, ({ i }) => {
           const off = vec3(i, j, k);
           const rnd = cellHash(cx.add(i), cy.add(j), cz.add(k), period); // = cell colour
           const pp = off.add(rnd.mul(randomness));
@@ -187,7 +196,9 @@ function voronoiSmoothF1(
           corr.assign(corr.div(float(1).add(sm.mul(3))));
           smoothC.assign(mix(smoothC, rnd, h).sub(corr));
           smoothP.assign(mix(smoothP, pp, h).sub(corr));
-        }
+        });
+      });
+    });
     if (want === "color") return smoothC;
     if (want === "position") return smoothP.add(cell);
     return smoothD;
@@ -223,29 +234,93 @@ export function blenderVoronoiDistanceToEdge(coord: V, randomness: V, period: nu
     const cx = int(cell.x);
     const cy = int(cell.y);
     const cz = int(cell.z);
-    const point = (i: number, j: number, k: number): V =>
+    const point = (i: V, j: V, k: V): V =>
       vec3(i, j, k).add(cellHash(cx.add(i), cy.add(j), cz.add(k), period).mul(randomness)).sub(local);
     const vectorToClosest = vec3(0, 0, 0).toVar();
     const minDist = float(1e10).toVar();
-    for (let k = -1; k <= 1; k++)
-      for (let j = -1; j <= 1; j++)
-        for (let i = -1; i <= 1; i++) {
+    namedLoop({ start: -1, end: int(1), name: "k", condition: "<=" }, ({ k }) => {
+      namedLoop({ start: -1, end: int(1), name: "j", condition: "<=" }, ({ j }) => {
+        namedLoop({ start: -1, end: int(1), name: "i", condition: "<=" }, ({ i }) => {
           const vp = point(i, j, k);
           const d = vp.dot(vp);
           const closer = d.lessThan(minDist);
           minDist.assign(closer.select(d, minDist));
           vectorToClosest.assign(closer.select(vp, vectorToClosest));
-        }
+        });
+      });
+    });
     const minEdge = float(1e10).toVar();
-    for (let k = -1; k <= 1; k++)
-      for (let j = -1; j <= 1; j++)
-        for (let i = -1; i <= 1; i++) {
+    namedLoop({ start: -1, end: int(1), name: "k", condition: "<=" }, ({ k }) => {
+      namedLoop({ start: -1, end: int(1), name: "j", condition: "<=" }, ({ j }) => {
+        namedLoop({ start: -1, end: int(1), name: "i", condition: "<=" }, ({ i }) => {
           const vp = point(i, j, k);
           const perp = vp.sub(vectorToClosest);
           const onEdge = perp.dot(perp).greaterThan(0.0001);
           const distanceToEdge = vectorToClosest.add(vp).div(2).dot(perp.normalize());
           minEdge.assign(onEdge.select(minEdge.min(distanceToEdge), minEdge));
-        }
+        });
+      });
+    });
     return minEdge;
+  })();
+}
+
+// Opt-in offline 2D distance-to-edge. The bake domain is a UV plane, so this searches two 3x3 neighborhoods
+// instead of Blender's two 3x3x3 neighborhoods: 18 periodic hash/candidate evaluations rather than 54.
+// It intentionally changes the exact seed tessellation by discarding the hashed z depth; the faithful path
+// remains the default and live 3D preview fallback.
+export function blenderVoronoiDistanceToEdge2D(coord: V, randomness: V, period: number | V): V {
+  return Fn(() => {
+    const cell = floor(coord) as V;
+    const local = coord.xy.sub(cell.xy) as V;
+    const cx = int(cell.x);
+    const cy = int(cell.y);
+    const point = (i: V, j: V): V =>
+      vec2(i, j).add(cellHash(cx.add(i), cy.add(j), int(0), period).xy.mul(randomness)).sub(local);
+    const vectorToClosest = vec2(0, 0).toVar();
+    const minDist = float(1e10).toVar();
+    namedLoop({ start: -1, end: int(1), name: "j", condition: "<=" }, ({ j }) => {
+      namedLoop({ start: -1, end: int(1), name: "i", condition: "<=" }, ({ i }) => {
+        const vp = point(i, j);
+        const d = vp.dot(vp);
+        const closer = d.lessThan(minDist);
+        minDist.assign(closer.select(d, minDist));
+        vectorToClosest.assign(closer.select(vp, vectorToClosest));
+      });
+    });
+    const minEdge = float(1e10).toVar();
+    namedLoop({ start: -1, end: int(1), name: "j", condition: "<=" }, ({ j }) => {
+      namedLoop({ start: -1, end: int(1), name: "i", condition: "<=" }, ({ i }) => {
+        const vp = point(i, j);
+        const perp = vp.sub(vectorToClosest);
+        const onEdge = perp.dot(perp).greaterThan(0.0001);
+        const distanceToEdge = vectorToClosest.add(vp).div(2).dot(perp.normalize());
+        minEdge.assign(onEdge.select(minEdge.min(distanceToEdge), minEdge));
+      });
+    });
+    return minEdge;
+  })();
+}
+
+// Per-cell scalar aligned with blenderVoronoiDistanceToEdge2D's winning 2D seed.
+export function blenderVoronoiCellRandom2D(coord: V, randomness: V, period: number | V): V {
+  return Fn(() => {
+    const cell = floor(coord) as V;
+    const local = coord.xy.sub(cell.xy) as V;
+    const cx = int(cell.x);
+    const cy = int(cell.y);
+    const minDist = float(1e10).toVar();
+    const win = vec2(0, 0).toVar();
+    namedLoop({ start: -1, end: int(1), name: "j", condition: "<=" }, ({ j }) => {
+      namedLoop({ start: -1, end: int(1), name: "i", condition: "<=" }, ({ i }) => {
+        const rnd = cellHash(cx.add(i), cy.add(j), int(0), period);
+        const point = vec2(i, j).add(rnd.xy.mul(randomness)).sub(local) as V;
+        const d = point.dot(point);
+        const closer = d.lessThan(minDist);
+        minDist.assign(closer.select(d, minDist));
+        win.assign(closer.select(vec2(i, j), win));
+      });
+    });
+    return cellHash(cx.add(int(win.x)), cy.add(int(win.y)), int(0), period).z;
   })();
 }
