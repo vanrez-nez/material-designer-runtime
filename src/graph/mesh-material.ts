@@ -43,6 +43,11 @@ function newClassicMaterial(type: MaterialType): THREE.Material {
 //
 // Note: `.aoMap` samples the mesh's SECOND UV set — replicate uv0→uv1 on the geometry
 // (`geometry.setAttribute("uv1", geometry.getAttribute("uv"))`) or ambient occlusion won't apply.
+//
+// Packed-ARM compatibility: this path needs NO pack awareness. Three's classic shaders read aoMap from R,
+// roughnessMap from G and metalnessMap from B — exactly the packed layout — and an unpacked field bake is a
+// grey broadcast (r=g=b), so those same reads are correct in both modes. Under packArm, `textures.get` hands
+// the SAME shared texture to all three slots.
 export function buildMeshMaterial(doc: MaterialGraphDocument, textures: ChannelTextures): THREE.Material {
   const cfg = readMaterialConfig(doc);
   const caps = MATERIAL_TYPE_CAPS[cfg.type];

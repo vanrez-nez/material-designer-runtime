@@ -28,6 +28,7 @@ export {
   compileSockets,
   countGraphNodes,
   newSurfaceMaterial,
+  readArmPacking,
   readMaterialSurface,
   readMaterialConfig,
   readOutputResolution,

@@ -4,8 +4,12 @@ import type { PbrSocket } from "../graph/types";
 // implement a store — server, CDN, their own IndexedDB, node fs — without pulling the renderer in.
 
 // A channel a bake can produce. "height" is not a PbrSocket (it drives parallax, not a lit channel) but it is
-// a real bake output with its own 8-bit target, so the cache carries it as a pseudo-channel.
-export type BakeCacheChannel = PbrSocket | "height";
+// a real bake output with its own 8-bit target, so the cache carries it as a pseudo-channel. "arm" is the
+// packed ARMH buffer (R=AO, G=roughness, B=metalness, A=height) a packArm bake renders INSTEAD of those
+// field channels and the height target; an entry's meta keeps describing the LOGICAL outputs — a record
+// whose `textures` holds "arm" still declares roughness/metallic/ambientOcclusion in `channels`, and
+// `hasHeight: true` means the height field rides the arm alpha (no separate "height" texel entry).
+export type BakeCacheChannel = PbrSocket | "height" | "arm";
 
 // How texels are stored on disk. All three are LOSSLESS — a restore must reproduce a bake exactly, or you
 // would author against one image and get a different one back.

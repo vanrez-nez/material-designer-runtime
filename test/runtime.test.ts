@@ -1,18 +1,25 @@
 import { describe, expect, it } from "vitest";
 import * as THREE from "three";
 import {
+  BakedTextureSet,
+  MaterialBakeService,
+  MaterialGraphRuntime,
   MaterialGraphSession,
+  SURFACE_CHANNELS,
   buildMeshMaterial,
   compileGraph,
   createDefaultMaterialDocument,
   createMaterialTopologyKey,
+  createMemoryCacheStore,
   defaultRegistry,
   migrateMaterialDocument,
+  readArmPacking,
   readMaterialSurface,
   readOutputResolution,
   type BakeReport,
   type MaterialGraphDocument,
   type MaterialType,
+  type PbrSocket,
 } from "../src";
 import { createBakeTimingBreakdown } from "../src/graph/bake-service";
 import {
@@ -515,5 +522,87 @@ describe("tile per-cell outputs + vector-rotate", () => {
       ],
     };
     expect(() => compileGraph(doc, defaultRegistry, { backend: "offline" })).not.toThrow();
+  });
+});
+
+describe("ARM packing", () => {
+  it("reads packArm as ON for sparse documents and coerces explicit/string forms", () => {
+    const doc = materialDoc("physical");
+    expect(readArmPacking(doc)).toBe(true); // sparse params — every pre-existing document opts in
+
+    doc.nodes[1]!.params.packArm = true;
+    expect(readArmPacking(doc)).toBe(true);
+    doc.nodes[1]!.params.packArm = false;
+    expect(readArmPacking(doc)).toBe(false);
+    doc.nodes[1]!.params.packArm = "false"; // MCP set_param may deliver strings
+    expect(readArmPacking(doc)).toBe(false);
+    doc.nodes[1]!.params.packArm = "true";
+    expect(readArmPacking(doc)).toBe(true);
+  });
+
+  it("aliases the three field sockets AND height to ONE shared ARMH texture when packed", () => {
+    const set = new BakedTextureSet(64, SURFACE_CHANNELS);
+    const arm = set.ensureArmTarget();
+    set.target("baseColor"); // baseColor keeps its own target either way
+    const present = new Set<PbrSocket>(["baseColor", "roughness", "metallic", "ambientOcclusion"]);
+    set.setPresence(present, true, true); // hasHeight: packed height rides the arm alpha
+
+    expect(set.texture("roughness")).toBe(arm.texture);
+    expect(set.texture("metallic")).toBe(arm.texture);
+    expect(set.texture("ambientOcclusion")).toBe(arm.texture);
+    expect(set.heightTexture()).toBe(arm.texture); // ARMH: A carries the height field
+    expect(set.texture("baseColor")).not.toBe(arm.texture);
+    expect(set.texture("baseColor")).not.toBeNull();
+    // A socket that wasn't present at the bake stays null even though packed texels exist for its slot —
+    // and a graph with no height keeps heightTexture() null.
+    set.setPresence(new Set<PbrSocket>(["roughness", "metallic"]), false, true);
+    expect(set.texture("ambientOcclusion")).toBeNull();
+    expect(set.heightTexture()).toBeNull();
+    // Unpacked, the dedicated height target is the source again.
+    const heightRt = set.ensureHeightTarget();
+    set.setPresence(new Set<PbrSocket>(["roughness", "metallic"]), true, false);
+    expect(set.heightTexture()).toBe(heightRt.texture);
+    set.dispose();
+  });
+
+  it("reports a signature change when only the pack flag toggles (forces a rewire)", () => {
+    const set = new BakedTextureSet(64, SURFACE_CHANNELS);
+    const present = new Set<PbrSocket>(["roughness", "metallic", "ambientOcclusion"]);
+    expect(set.setPresence(present, false, true)).toBe(true); // first presence
+    expect(set.setPresence(present, false, true)).toBe(false); // unchanged
+    expect(set.setPresence(present, false, false)).toBe(true); // pack toggle alone must rewire
+    set.dispose();
+  });
+
+  it("hydrates a cached 'arm' record as the SAME texture for every field socket", async () => {
+    const size = 8;
+    const bytes = size * size * 4;
+    const runtime = new MaterialGraphRuntime({
+      document: materialDoc("physical"),
+      bakeService: new MaterialBakeService(), // own service so the shared singleton's cache isn't touched
+      cache: { store: createMemoryCacheStore(), enabled: true },
+    });
+    await runtime.cache!.write(runtime.cacheKey(), {
+      size,
+      channels: ["baseColor", "roughness", "metallic", "ambientOcclusion"],
+      // ARMH: no separate "height" texel entry — the flag alone says height rides the arm alpha.
+      hasHeight: true,
+      bakeMs: 1000,
+      textures: [
+        { channel: "baseColor", encoding: "rgba8", bytes: new Uint8Array(bytes).fill(3) },
+        { channel: "arm", encoding: "rgba8", bytes: new Uint8Array(bytes).fill(9) },
+      ],
+    });
+
+    const cached = await runtime.loadCachedChannelTextures();
+    expect(cached).not.toBeNull();
+    const rough = cached!.get("roughness");
+    expect(rough).not.toBeNull();
+    expect(cached!.get("metallic")).toBe(rough);
+    expect(cached!.get("ambientOcclusion")).toBe(rough);
+    expect(cached!.height).toBe(rough); // ARMH: the height slot is the same packed texture (alpha)
+    expect(cached!.get("baseColor")).not.toBe(rough);
+    // The shared texture is mapped under four slots — dispose must dedupe, not quadruple-dispose.
+    expect(() => cached!.dispose()).not.toThrow();
   });
 });

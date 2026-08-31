@@ -1,7 +1,9 @@
 import * as THREE from "three";
 import { RenderTarget, type WebGPURenderer, type MeshBasicNodeMaterial } from "three/webgpu";
-import { vec3 } from "three/tsl";
+import { vec3, vec4 } from "three/tsl";
 import {
+  FIELD_CHANNELS,
+  type ChannelPassMode,
   encodeChannel,
   renderColorNodeToTarget,
   renderMaterialToTarget,
@@ -11,7 +13,7 @@ import {
   ssPoolInfo,
   configureChannelTexture,
 } from "./channel-baker";
-import { countGraphNodes, type CacheEntry, type CacheSizing, type ParamUsage } from "./compiler";
+import { countGraphNodes, readArmPacking, type CacheEntry, type CacheSizing, type ParamUsage } from "./compiler";
 import {
   channelByteLength,
   readTargetTexels,
@@ -71,10 +73,17 @@ export const SURFACE_CHANNELS: PbrSocket[] = [
   "baseColor", "roughness", "metallic", "ambientOcclusion", "normal", "emission",
 ];
 
+// The three scalar channels a packArm bake folds into one texture (R=AO, G=roughness, B=metalness — three's
+// native aoMap/roughnessMap/metalnessMap layout). Typed against the wider cache-channel union so presence
+// sets and cache records test with it directly.
+function isFieldChannel(ch: BakeCacheChannel): ch is PbrSocket {
+  return (FIELD_CHANNELS as readonly string[]).includes(ch);
+}
+
 // Allocate a render target configured for surface sampling (moved verbatim from OfflineMaterial.ensureTarget):
 // colour channels sRGB (sampler linearises for PBR), data channels linear; repeat-wrap + trilinear/aniso
 // mips so the high-frequency maps don't shimmer at grazing angles.
-function makeChannelTarget(ch: PbrSocket | "height", size: number): RenderTarget {
+function makeChannelTarget(ch: PbrSocket | "height" | "arm", size: number): RenderTarget {
   // Color-only bake pass — no depth test — so skip the (default) depth/stencil attachment.
   const rt = new RenderTarget(size, size, { depthBuffer: false, stencilBuffer: false });
   // The sampling/colour-space contract lives in channel-baker, shared with the cache's DataTexture hydration
@@ -187,7 +196,9 @@ export class BakedTextureSet {
   private readonly targets = new Map<PbrSocket, RenderTarget>();
   // Persistent per-channel bake material (colorNode assigned at compile time). Re-rendering these without
   // reassigning colorNode reuses their pipelines — the uniform fast path (no recompile on a slider drag).
-  private readonly mats = new Map<PbrSocket | "height", MeshBasicNodeMaterial>();
+  // Keyed by the cache-channel union so the packed "arm" material lives here too (and the dispose/flush
+  // loops cover it for free).
+  private readonly mats = new Map<BakeCacheChannel, MeshBasicNodeMaterial>();
   // Decomposition: intermediate group-output textures (16F) + their persistent bake materials, keyed by
   // cacheId. Rendered bottom-up (see `cachePlan`) BEFORE the channels, which sample them — so no channel
   // shader inlines the whole graph. `cachePlan` is retained so a uniform re-render regenerates caches in order.
@@ -212,6 +223,15 @@ export class BakedTextureSet {
   >();
   heightTarget: RenderTarget | null = null;
   hasHeight = false;
+  // Packed-ARMH state (Material Output's `packArm`). When `packedFields` is true, the last bake rendered the
+  // three field channels into `armTarget` (R=AO, G=roughness, B=metalness) instead of individual targets —
+  // plus the height field in A when the graph drives height — and texture()/heightTexture() resolve those
+  // sockets to the SHARED arm texture. Individual field/height targets from a previous unpacked bake are
+  // deliberately retained (not disposed) — the accessors bypass them, resize() keeps them size-consistent,
+  // and a toggle-back reuses them; eager disposal risks "Destroyed texture used in a submit" for a texture a
+  // preview canvas or compiled shader still holds.
+  armTarget: RenderTarget | null = null;
+  packedFields = false;
   // The set of channels that were actually connected at the last bake, plus a height flag — folded into a
   // signature so a surface can tell when it must rewire its samplers (vs. just re-render in place).
   present = new Set<PbrSocket>();
@@ -266,6 +286,10 @@ export class BakedTextureSet {
       this.heightTarget.setSize(size, size);
       this.heightTarget.texture.needsUpdate = true;
     }
+    if (this.armTarget) {
+      this.armTarget.setSize(size, size);
+      this.armTarget.texture.needsUpdate = true;
+    }
     this.flushCaches();
   }
 
@@ -280,7 +304,7 @@ export class BakedTextureSet {
 
   // The persistent bake material for a channel (created on first use). `bakeInto` sets its colorNode;
   // `rerenderInto` reuses it as-is.
-  channelMaterial(ch: PbrSocket | "height"): MeshBasicNodeMaterial {
+  channelMaterial(ch: BakeCacheChannel): MeshBasicNodeMaterial {
     let m = this.mats.get(ch);
     if (!m) {
       m = makeChannelMaterial();
@@ -348,7 +372,7 @@ export class BakedTextureSet {
   // has been baked yet.
   firstTarget(): RenderTarget | null {
     for (const rt of this.targets.values()) return rt;
-    return this.heightTarget;
+    return this.armTarget ?? this.heightTarget;
   }
 
   ensureHeightTarget(): RenderTarget {
@@ -356,19 +380,41 @@ export class BakedTextureSet {
     return this.heightTarget;
   }
 
-  // The baked texture for a channel (null if never baked). Surfaces sample these.
+  ensureArmTarget(): RenderTarget {
+    if (!this.armTarget) this.armTarget = makeChannelTarget("arm", this.size);
+    return this.armTarget;
+  }
+
+  // The baked texture for a channel (null if never baked). Surfaces sample these. Under packArm the three
+  // field sockets resolve to the SAME shared ARM texture — the whole query chain (surface wiring,
+  // getChannelTexture, buildMeshMaterial, previews) inherits the merge from this one spot. Sockets that
+  // weren't connected at the last bake stay null either way, so presence semantics don't change.
   texture(ch: PbrSocket): THREE.Texture | null {
+    if (this.packedFields && isFieldChannel(ch))
+      return this.present.has(ch) ? (this.armTarget?.texture ?? null) : null;
     return this.targets.get(ch)?.texture ?? null;
+  }
+
+  // The baked height field's texture (null when the graph drives no height). Packed bakes carry height in
+  // the ARMH texture's ALPHA (sample .a); unpacked bakes keep the dedicated grey target (sample .r).
+  heightTexture(): THREE.Texture | null {
+    if (!this.hasHeight) return null;
+    if (this.packedFields) return this.armTarget?.texture ?? null;
+    return this.heightTarget?.texture ?? null;
   }
 
   // Record which channels this set now holds and fold them into the rewire signature. Returns true when the
   // signature changed, i.e. the caller must rewire its samplers. Shared by the bake and the cache-restore
-  // paths so the two can never disagree on what "changed" means.
-  setPresence(present: Set<PbrSocket>, hasHeight: boolean): boolean {
-    const signature = [...present].sort().join(",") + (hasHeight ? "|h" : "");
+  // paths so the two can never disagree on what "changed" means. `packedFields` is part of the signature
+  // because a pack toggle changes WHICH component of the texture each sampler must read (see
+  // TexturedSurface.wire), even though the present set is identical.
+  setPresence(present: Set<PbrSocket>, hasHeight: boolean, packedFields = false): boolean {
+    const signature =
+      [...present].sort().join(",") + (hasHeight ? "|h" : "") + (packedFields ? "|arm" : "");
     const changed = signature !== this.signature;
     this.present = present;
     this.hasHeight = hasHeight;
+    this.packedFields = packedFields;
     this.signature = signature;
     return changed;
   }
@@ -426,6 +472,8 @@ export class BakedTextureSet {
       cacheMats: this.cacheMats.size,
       constArrays: this.constArrays.size,
       heightTarget: this.heightTarget ? 1 : 0,
+      armTarget: this.armTarget ? 1 : 0,
+      packedFields: this.packedFields ? 1 : 0,
       restored: this.restored ? 1 : 0,
     };
   }
@@ -465,6 +513,8 @@ export class BakedTextureSet {
     this.constArrays.clear();
     this.heightTarget?.dispose();
     this.heightTarget = null;
+    this.armTarget?.dispose();
+    this.armTarget = null;
   }
 }
 
@@ -630,6 +680,7 @@ export class MaterialBakeService {
       // (multi-hundred-MB) cache re-render on every solo toggle.
       if (!opts.soloNodeId) set.pruneCaches(new Set(cachePlan.map((e) => e.cacheId)));
       const channels = opts.channels ?? set.channels;
+      const packed = readArmPacking(graph.document);
       const decorateVec3 = (node: MaterialValue): MaterialValue => opts.shaderVariant?.vec3(node) ?? node;
       const present = new Set<PbrSocket>();
       // Collect channel jobs first (assigning colorNode + needsUpdate is what marks them for recompile).
@@ -637,25 +688,52 @@ export class MaterialBakeService {
         channel: BakeCacheChannel;
         mat: MeshBasicNodeMaterial;
         target: RenderTarget;
-        isNormal: boolean;
+        mode: ChannelPassMode;
       };
       const jobs: Job[] = [];
+      // packArm: the field channels render ONCE into the shared ARMH target instead of one target each,
+      // with the height field folded into its alpha.
+      const armInputs: { ao?: MaterialValue; rough?: MaterialValue; metal?: MaterialValue } = {};
       for (const ch of channels) {
         const node = (bundle as Partial<Record<string, MaterialValue>>)[ch];
         if (!node) continue;
+        if (packed && isFieldChannel(ch)) {
+          if (ch === "ambientOcclusion") armInputs.ao = node;
+          else if (ch === "roughness") armInputs.rough = node;
+          else armInputs.metal = node;
+          present.add(ch); // logically present; texture() resolves it to the arm target
+          continue;
+        }
         const mat = set.channelMaterial(ch);
         mat.colorNode = decorateVec3(encodeChannel(node, ch));
         mat.needsUpdate = true;
-        jobs.push({ channel: ch, mat, target: set.target(ch), isNormal: ch === "normal" });
+        jobs.push({ channel: ch, mat, target: set.target(ch), mode: ch === "normal" ? "normal" : "color" });
         present.add(ch);
       }
-      // Height drives the parallax UV offset (its own linear target), not a lit channel.
+      // Height drives the parallax UV offset, not a lit channel. Packed → it rides the ARMH alpha (the
+      // "vec4" pass mode exists exactly so the downsample doesn't flatten it to 1); unpacked → its own
+      // dedicated grey target as before.
       set.hasHeight = bundle.height !== undefined;
-      if (set.hasHeight) {
+      if (packed && (armInputs.ao || armInputs.rough || armInputs.metal || set.hasHeight)) {
+        const armMat = set.channelMaterial("arm");
+        // Linear, no encode — same as encodeChannel's field branch, but composed instead of broadcast.
+        // Neutral fallbacks for an absent socket (no occlusion / full rough / no metal / flat height) are
+        // baked but never surfaced: an absent socket stays out of `present` (and hasHeight stays false), so
+        // texture()/heightTexture() return null for it and consumers keep their scalar/vertex fallbacks.
+        const rgb = decorateVec3(vec3(armInputs.ao ?? 1, armInputs.rough ?? 1, armInputs.metal ?? 0));
+        armMat.colorNode = vec4(rgb, bundle.height ?? 1);
+        // Without this, three's node builder treats the material as opaque and forces alpha to 1 at shader
+        // build time (NodeBuilder.isOpaque) — silently flattening the packed height. Set before the
+        // compile-marking needsUpdate below so the built shader keeps the alpha lane.
+        armMat.blending = THREE.NoBlending;
+        armMat.needsUpdate = true;
+        jobs.push({ channel: "arm", mat: armMat, target: set.ensureArmTarget(), mode: "vec4" });
+      }
+      if (set.hasHeight && !packed) {
         const hm = set.channelMaterial("height");
         hm.colorNode = decorateVec3(vec3(bundle.height));
         hm.needsUpdate = true;
-        jobs.push({ channel: "height", mat: hm, target: set.ensureHeightTarget(), isNormal: false });
+        jobs.push({ channel: "height", mat: hm, target: set.ensureHeightTarget(), mode: "color" });
       }
       const generatedChannels = jobs.map((job) => job.channel);
       let timings = createBakeTimingBreakdown(queueWaitMs, { graphCompileMs: compileMs });
@@ -717,9 +795,9 @@ export class MaterialBakeService {
       // gate or a double-compile).
       const tDispatch0 = performance.now();
       for (const j of jobs)
-        renderMaterialToTarget(renderer, j.mat, j.target, j.isNormal, opts.shaderVariant);
+        renderMaterialToTarget(renderer, j.mat, j.target, j.mode, opts.shaderVariant);
       const dispatchMs = performance.now() - tDispatch0;
-      const changed = set.setPresence(present, set.hasHeight);
+      const changed = set.setPresence(present, set.hasHeight, packed);
       // Wait for the GPU to actually finish before resolving — gives the caller real back-pressure so it
       // can't submit the next bake while this one is still executing (the cause of the editing GPU backlog).
       const tGpu0 = performance.now();
@@ -772,11 +850,26 @@ export class MaterialBakeService {
       // surface can't reach here (its paramUsage is empty, so every edit routes to a rebuild), but this method
       // is public, so refuse rather than trust the caller.
       if (set.restored) return;
-      const total = set.present.size + (set.hasHeight && set.heightTarget ? 1 : 0);
+      // The channels this run physically re-renders. Under packArm the field channels (and height) have NO
+      // compiled individual materials — channelMaterial()/target() would lazily create colorNode-less ones
+      // and draw them black, and a RETAINED height material from an earlier unpacked compile is just as
+      // dangerous (its stale TSL tree can sample pruned cache targets) — so they all collapse into the
+      // single retained "arm" (ARMH) render.
+      const generatedChannels: BakeCacheChannel[] = [];
+      for (const ch of set.present) {
+        if (set.packedFields && isFieldChannel(ch)) continue;
+        generatedChannels.push(ch);
+      }
+      const renderArm =
+        set.packedFields &&
+        set.armTarget !== null &&
+        (set.hasHeight || [...set.present].some(isFieldChannel));
+      if (renderArm) generatedChannels.push("arm");
+      const renderHeight = set.hasHeight && set.heightTarget !== null && !set.packedFields;
+      if (renderHeight) generatedChannels.push("height");
+      const total = generatedChannels.length;
       // Uniform re-render: no recompile (nodeCount 0), only the channel renders are regenerated.
       const queueWaitMs = performance.now() - queuedAt;
-      const generatedChannels: BakeCacheChannel[] = [...set.present];
-      if (set.hasHeight && set.heightTarget) generatedChannels.push("height");
       const report: BakeReport = {
         runId: ++this.bakeRunId,
         source,
@@ -804,20 +897,30 @@ export class MaterialBakeService {
       const cacheDispatchMs = performance.now() - tCacheDispatch0;
       const tChannelDispatch0 = performance.now();
       for (const ch of set.present) {
+        if (set.packedFields && isFieldChannel(ch)) continue; // re-rendered once via the arm material below
         renderMaterialToTarget(
           renderer,
           set.channelMaterial(ch),
           set.target(ch),
-          ch === "normal",
+          ch === "normal" ? "normal" : "color",
           set.shaderVariant,
         );
       }
-      if (set.hasHeight && set.heightTarget) {
+      if (renderArm) {
+        renderMaterialToTarget(
+          renderer,
+          set.channelMaterial("arm"),
+          set.armTarget!,
+          "vec4",
+          set.shaderVariant,
+        );
+      }
+      if (renderHeight) {
         renderMaterialToTarget(
           renderer,
           set.channelMaterial("height"),
-          set.heightTarget,
-          false,
+          set.heightTarget!,
+          "color",
           set.shaderVariant,
         );
       }
@@ -971,7 +1074,8 @@ export class MaterialBakeService {
         entry.textures.length > 0 &&
         entry.textures.every(
           (t) =>
-            (t.channel === "height" || wanted.has(t.channel)) && t.bytes.length === expected,
+            (t.channel === "height" || t.channel === "arm" || wanted.has(t.channel)) &&
+            t.bytes.length === expected,
         );
       if (!usable) {
         await cache.delete(key);
@@ -984,10 +1088,23 @@ export class MaterialBakeService {
       set.flushCaches();
       const present = new Set<PbrSocket>();
       let hasHeight = false;
+      // A packed record is self-describing: its texels carry "arm" instead of the three field channels
+      // (which its `channels` meta still lists as the logical sockets) — and the height field in that
+      // buffer's ALPHA, flagged by the entry's `hasHeight` meta rather than a separate height texel entry.
+      // Pack-state consistency with the document is guaranteed by the key — packArm is a structural param,
+      // so a packed entry can only be hit by a packed document.
+      let packed = false;
       for (const texels of entry.textures) {
         if (texels.channel === "height") {
           writeTargetTexels(renderer, set.ensureHeightTarget(), texels.bytes);
           hasHeight = true;
+          continue;
+        }
+        if (texels.channel === "arm") {
+          writeTargetTexels(renderer, set.ensureArmTarget(), texels.bytes);
+          for (const ch of entry.channels) if (isFieldChannel(ch)) present.add(ch);
+          packed = true;
+          hasHeight = hasHeight || entry.hasHeight;
           continue;
         }
         writeTargetTexels(renderer, set.target(texels.channel), texels.bytes);
@@ -1009,7 +1126,7 @@ export class MaterialBakeService {
         totalMs: 0,
       };
       this.emitReport(report);
-      const changed = set.setPresence(present, hasHeight);
+      const changed = set.setPresence(present, hasHeight, packed);
       set.restored = true;
       set.contentStamp += 1;
       // Same back-pressure contract as a bake: resolve only once the GPU has actually finished, so the caller
@@ -1089,8 +1206,19 @@ export class MaterialBakeService {
     if (set.restored) return;
     try {
       const channels = (opts.channels ?? set.channels).filter((ch) => set.present.has(ch));
-      const includeHeight = set.hasHeight && set.heightTarget !== null;
-      const count = channels.length + (includeHeight ? 1 : 0);
+      // Under packArm the field channels AND the height field live in ONE shared ARMH target — read that
+      // back once as "arm" instead of per socket (its RGBA8 readback carries the height alpha for free).
+      // set.target(ch)/heightTarget for a packed channel would lazily allocate a never-rendered target and
+      // store black texels. The entry's `channels`/`hasHeight` meta still describe the logical outputs.
+      const includeHeight = set.hasHeight && set.heightTarget !== null && !set.packedFields;
+      const readbackChannels = set.packedFields
+        ? channels.filter((ch) => !isFieldChannel(ch))
+        : channels;
+      const includeArm =
+        set.packedFields &&
+        set.armTarget !== null &&
+        (set.hasHeight || channels.some(isFieldChannel));
+      const count = readbackChannels.length + (includeArm ? 1 : 0) + (includeHeight ? 1 : 0);
       if (count === 0) return;
       const bytes = channelByteLength(set.size) * count;
       // Ask policy BEFORE reading anything back: the readback is the expensive part, and there is no sense
@@ -1100,7 +1228,7 @@ export class MaterialBakeService {
       // Already stored (the common reload-then-idle case): bump LRU position and skip the readback entirely.
       if (await cache.peek(key)) return;
       const textures: BakeCacheTexels[] = [];
-      for (const ch of channels) {
+      for (const ch of readbackChannels) {
         textures.push({
           channel: ch,
           encoding: "rgba8",
@@ -1108,6 +1236,14 @@ export class MaterialBakeService {
         });
         // Re-check between channels: a readback awaits, so an edit can land mid-capture and make the rest of
         // these channels inconsistent with the first ones.
+        if (set.contentStamp !== stamp || set.disposed) return;
+      }
+      if (includeArm) {
+        textures.push({
+          channel: "arm",
+          encoding: "rgba8",
+          bytes: await readTargetTexels(renderer, set.armTarget!),
+        });
         if (set.contentStamp !== stamp || set.disposed) return;
       }
       if (includeHeight) {
@@ -1127,7 +1263,9 @@ export class MaterialBakeService {
         .write(key, {
           size: set.size,
           channels,
-          hasHeight: includeHeight,
+          // The LOGICAL height flag: true also for a packed entry whose height rides the arm alpha with no
+          // "height" texel entry of its own — the restore path re-arms parallax from this.
+          hasHeight: set.hasHeight,
           bakeMs: set.lastRebuildMs,
           textures,
         })

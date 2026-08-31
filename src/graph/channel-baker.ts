@@ -1,5 +1,6 @@
 import { QuadMesh, RenderTarget, MeshBasicNodeMaterial, type WebGPURenderer } from "three/webgpu";
 import {
+  NoBlending,
   NoColorSpace,
   SRGBColorSpace,
   NearestFilter,
@@ -10,7 +11,7 @@ import {
   OrthographicCamera,
   type Texture,
 } from "three";
-import { vec3, vec2, sRGBTransferOETF, texture, uv, normalize } from "three/tsl";
+import { vec3, vec4, vec2, sRGBTransferOETF, texture, uv, normalize } from "three/tsl";
 import type { MaterialValue, PbrSocket } from "./types";
 import type { ShaderVariant } from "./shader-variant";
 
@@ -48,11 +49,27 @@ const bakeQuad = new QuadMesh(new MeshBasicNodeMaterial());
 // material would retain its LAST colorNode — pinning that whole compiled graph (TSL tree + pipeline via
 // the renderer's strong caches) until the next one-off, invisibly to any flush/regenerate.
 
+// How a channel renders through the supersample pipeline. "color" box-averages RGB (alpha ignored),
+// "normal" averages DECODED vectors then renormalizes + re-encodes, "vec4" box-averages all four
+// components — the packed ARMH pass, whose alpha carries the height field and must survive the downsample
+// (the color path's vec3 colorNode would write alpha = 1).
+export type ChannelPassMode = "color" | "normal" | "vec4";
+
 // Box filter: average the SS×SS high-res texels covering each destination texel. The normal channel must
 // average decoded vectors (raw encoded [0,1] normals don't average linearly), then renormalize + re-encode.
 // `ssTexel` (1 / high-res size) is a build-time constant baked into the node — each pooled size gets its own.
-function downsampleNode(ssTex: Texture, ssTexel: MaterialValue, isNormal: boolean): MaterialValue {
+function downsampleNode(ssTex: Texture, ssTexel: MaterialValue, mode: ChannelPassMode): MaterialValue {
   const c = (SS - 1) / 2;
+  if (mode === "vec4") {
+    let acc4: MaterialValue = vec4(0, 0, 0, 0);
+    for (let j = 0; j < SS; j++)
+      for (let i = 0; i < SS; i++) {
+        const off = vec2(i - c, j - c).mul(ssTexel);
+        acc4 = acc4.add(texture(ssTex, uv().add(off)));
+      }
+    return acc4.div(SS * SS);
+  }
+  const isNormal = mode === "normal";
   let acc: MaterialValue = vec3(0, 0, 0);
   for (let j = 0; j < SS; j++)
     for (let i = 0; i < SS; i++) {
@@ -65,7 +82,7 @@ function downsampleNode(ssTex: Texture, ssTexel: MaterialValue, isNormal: boolea
   return isNormal ? normalize(acc).mul(0.5).add(0.5) : acc;
 }
 
-// A supersample intermediate + its two prebuilt downsample quads, all bound to a FIXED high-res size.
+// A supersample intermediate + its prebuilt per-mode downsample quads, all bound to a FIXED high-res size.
 // Raw high-res RT stores already-encoded channel values verbatim (no colorspace / filtering so the box taps
 // read exact texels). The downsample quads' node graphs reference THIS target's texture, so the target must
 // never be resized — instead we pool one set per size (see ssTargetsFor).
@@ -73,6 +90,7 @@ interface SsTargets {
   ssRT: RenderTarget;
   downColorQuad: QuadMesh;
   downNormalQuad: QuadMesh;
+  downVec4Quad: QuadMesh;
 }
 // Pool keyed by "<w>x<h>" of the high-res target. The interactive surface bake (e.g. 2048²) and the 2D
 // preview / PNG readback (a smaller size) each keep their OWN persistent target, instead of resizing one
@@ -97,13 +115,29 @@ function ssTargetsFor(w: number, h: number, shaderVariant?: ShaderVariant): SsTa
   ssRT.texture.minFilter = ssRT.texture.magFilter = NearestFilter;
   ssRT.texture.wrapS = ssRT.texture.wrapT = RepeatWrapping; // box taps at tile edges wrap, not clamp
   const ssTexel = vec2(1 / w, 1 / h); // constant for this size
-  const mkDown = (isNormal: boolean): QuadMesh => {
+  const mkDown = (mode: ChannelPassMode): QuadMesh => {
     const mat = new MeshBasicNodeMaterial();
-    const colorNode = downsampleNode(ssRT.texture, ssTexel, isNormal);
-    mat.colorNode = shaderVariant?.vec3(colorNode) ?? colorNode;
+    // The vec4 pass must WRITE its alpha (the packed height). Three's node builder forces
+    // diffuseColor.a = 1 for opaque NormalBlending materials (NodeBuilder.isOpaque), so opt out of
+    // blending entirely — a fullscreen bake quad wants a direct src write anyway.
+    if (mode === "vec4") mat.blending = NoBlending;
+    const colorNode = downsampleNode(ssRT.texture, ssTexel, mode);
+    // The shader-variant decoration (profiling cache buster) is a vec3 transform; for the vec4 pass apply
+    // it to the colour lanes and carry alpha (the packed height) through untouched.
+    mat.colorNode =
+      shaderVariant === undefined
+        ? colorNode
+        : mode === "vec4"
+          ? vec4(shaderVariant.vec3(colorNode.xyz), colorNode.w)
+          : shaderVariant.vec3(colorNode);
     return new QuadMesh(mat);
   };
-  const targets: SsTargets = { ssRT, downColorQuad: mkDown(false), downNormalQuad: mkDown(true) };
+  const targets: SsTargets = {
+    ssRT,
+    downColorQuad: mkDown("color"),
+    downNormalQuad: mkDown("normal"),
+    downVec4Quad: mkDown("vec4"),
+  };
   ssPool.set(key, targets);
   return targets;
 }
@@ -122,7 +156,7 @@ export function makeChannelMaterial(): MeshBasicNodeMaterial {
 // to the bake render targets and to a DataTexture hydrated from the persistent cache, so a cached channel
 // samples identically to a freshly baked one — if these two drifted apart, a restored material would light
 // differently from a baked one and the cause would be near-invisible.
-export function configureChannelTexture(t: Texture, ch: PbrSocket | "height"): void {
+export function configureChannelTexture(t: Texture, ch: PbrSocket | "height" | "arm"): void {
   t.colorSpace =
     ch !== "height" && COLOR_CHANNELS.includes(ch as PbrSocket) ? SRGBColorSpace : NoColorSpace;
   t.wrapS = t.wrapT = RepeatWrapping;
@@ -261,18 +295,19 @@ export function renderCacheToTarget(
 
 // Render `material` (its colorNode already assigned) into `rt`, supersampled + box-downsampled. This does NOT
 // touch colorNode/needsUpdate — so when the material is unchanged since its last compile it is a pure
-// re-render (the uniform fast path). `isNormal` switches the downsample to vector-correct averaging.
+// re-render (the uniform fast path). `mode` selects the downsample: vector-correct averaging for "normal",
+// alpha-preserving vec4 averaging for the packed ARMH pass.
 export function renderMaterialToTarget(
   renderer: WebGPURenderer,
   material: MeshBasicNodeMaterial,
   rt: RenderTarget,
-  isNormal = false,
+  mode: ChannelPassMode = "color",
   shaderVariant?: ShaderVariant,
 ): void {
   // Pick (or lazily create) the persistent supersample target for this destination size — never resize a
   // shared one (see ssTargetsFor). Same-size renders reuse the same GPU textures, so nothing is created or
   // destroyed per bake.
-  const { ssRT, downColorQuad, downNormalQuad } = ssTargetsFor(
+  const { ssRT, downColorQuad, downNormalQuad, downVec4Quad } = ssTargetsFor(
     rt.width * SS,
     rt.height * SS,
     shaderVariant,
@@ -282,7 +317,7 @@ export function renderMaterialToTarget(
   renderer.setRenderTarget(ssRT); // 1) render the channel at SS×
   bakeQuad.render(renderer);
   renderer.setRenderTarget(rt); // 2) box-downsample into the destination
-  (isNormal ? downNormalQuad : downColorQuad).render(renderer);
+  (mode === "normal" ? downNormalQuad : mode === "vec4" ? downVec4Quad : downColorQuad).render(renderer);
   renderer.setRenderTarget(previous);
 }
 
@@ -297,7 +332,7 @@ export function renderColorNodeToTarget(
   const mat = new MeshBasicNodeMaterial();
   mat.colorNode = colorNode;
   mat.needsUpdate = true;
-  renderMaterialToTarget(renderer, mat, rt, isNormal);
+  renderMaterialToTarget(renderer, mat, rt, isNormal ? "normal" : "color");
   // Submitted command buffers keep their GPU objects alive (Dawn refcounts); disposing here only drops the
   // renderer's cache entries so nothing pins the compiled graph after the render.
   mat.dispose();

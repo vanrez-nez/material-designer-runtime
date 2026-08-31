@@ -18,14 +18,23 @@ const MIN_VIEW_Z = 0.3;
 // texture sample sits in straight-line, uniform control flow — WGSL forbids implicit-derivative sampling
 // inside a dynamic loop, and unrolling sidesteps it without needing explicit gradients. Layer selection is
 // branchless (`select`), freezing the result UV at the first crossing.
-export function parallaxOcclusionUV(heightMap: Texture, baseUv: V, scale: V, layers: number): V {
+// `heightChannel` names where the height field lives in `heightMap`: "r" for a dedicated grey height map,
+// "a" for the packed ARMH texture (R=AO, G=roughness, B=metalness, A=height).
+export function parallaxOcclusionUV(
+  heightMap: Texture,
+  baseUv: V,
+  scale: V,
+  layers: number,
+  heightChannel: "r" | "a" = "r",
+): V {
   return Fn(() => {
     // Tangent-space view direction (fragment → camera): xy is the in-plane shear, z the facing term.
     // NOTE: three's `parallaxDirection` is deliberately NOT normalized (its `.normalize()` is commented out)
     // — it's tuned for the single-step `parallaxUV`, where the leftover magnitude bakes in a cosine factor.
     // For a marching ray we need a unit direction, or the offset magnitude blows up and smears the texture.
     const viewDir = (parallaxDirection as V).normalize();
-    const h = (uvc: V): V => texture(heightMap, uvc).x; // sampled height [0,1]
+    const h = (uvc: V): V =>
+      heightChannel === "a" ? texture(heightMap, uvc).w : texture(heightMap, uvc).x; // sampled height [0,1]
 
     const invN = 1 / layers;
     // Total UV shift over the full [0,1] depth range; /z deepens it at grazing angles (steep POM).

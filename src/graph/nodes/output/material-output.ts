@@ -23,6 +23,12 @@ export const materialOutputNode: MaterialNodeDef = {
       options: ["128", "256", "512", "1024", "2048", "4096"],
       default: "1024",
     },
+    // Pack AO / roughness / metalness / height into ONE ARMH texture (R=AO, G=roughness, B=metalness —
+    // three.js's native aoMap/roughnessMap/metalnessMap convention — plus A=height when the graph drives
+    // height). Channel-texture queries then return the same shared texture for all three field sockets (and
+    // the height query resolves to it too). `bool` → structural → toggling re-bakes. Default ON; sparse
+    // documents (every pre-existing preset) read as ON via readArmPacking.
+    { key: "packArm", label: "pack ARMH", type: "bool", default: true },
   ],
   build() {
     return {};

@@ -291,6 +291,19 @@ export function readOutputResolution(doc: MaterialGraphDocument): number {
   return Number.isFinite(n) && n > 0 ? n : 1024;
 }
 
+// Whether this document packs AO/roughness/metalness — plus height in the alpha — into one ARMH texture
+// (Material Output's `packArm` param; see material-output.ts). Same shallow-read pattern as
+// readOutputResolution. Defaults to TRUE for a sparse/absent param — node params are stored sparsely, so
+// every pre-existing document opts in. String forms are accepted because MCP set_param and hand-edited
+// documents may carry "true"/"false".
+export function readArmPacking(doc: MaterialGraphDocument): boolean {
+  const out = doc.nodes.find((n) => n.type === MATERIAL_OUTPUT_TYPE);
+  const raw = out?.params?.packArm;
+  if (typeof raw === "boolean") return raw;
+  if (typeof raw === "string") return raw !== "false";
+  return true;
+}
+
 // The material family + type-specific settings the graph reconstructs, read from the shader node feeding
 // Material Output's `surface` input. Mirrors readOutputResolution: a shallow document read (no compile) so
 // both the live path (compileGraph) and the offline surface (textured-surface) derive the type from ONE

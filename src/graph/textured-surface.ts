@@ -170,8 +170,10 @@ export class TexturedSurface {
     return this.set.texture(ch);
   }
   // The baked height field texture (null if the graph has no height output). Same stable-object contract.
+  // NB: under packArm this is the shared ARMH texture and the height field lives in its ALPHA channel;
+  // unpacked it is the dedicated grey height map (read .r).
   getHeightTexture(): THREE.Texture | null {
-    return this.set.heightTarget?.texture ?? null;
+    return this.set.heightTexture();
   }
   // The channels connected/baked at the last bake. Consumers use this to know which previews to show.
   presentChannels(): ReadonlySet<PbrSocket> {
@@ -466,10 +468,18 @@ export class TexturedSurface {
     const caps = MATERIAL_TYPE_CAPS[this.matType];
     const scale = this.scaleUniform;
     const sharp = this.sharpnessUniform;
-    const useParallax = this.set.hasHeight && !this.triplanar && this.parallaxScale.value > 0;
+    // Height source: the dedicated grey map (.r), or the packed ARMH texture's alpha under packArm.
+    const heightTex = this.set.heightTexture();
+    const useParallax = heightTex !== null && !this.triplanar && this.parallaxScale.value > 0;
     const baseUv = uv();
     const pUv: MaterialValue = useParallax
-      ? parallaxOcclusionUV(this.set.heightTarget!.texture, baseUv, this.parallaxScale, PARALLAX_LAYERS)
+      ? parallaxOcclusionUV(
+          heightTex!,
+          baseUv,
+          this.parallaxScale,
+          PARALLAX_LAYERS,
+          this.set.packedFields ? "a" : "r",
+        )
       : undefined;
     // Sample AT the parallax-offset location but take the mip LOD from the smooth base-UV derivatives.
     const ddx = baseUv.dFdx();
@@ -499,10 +509,17 @@ export class TexturedSurface {
     // Common channels — every family lights these.
     m.colorNode = present.has("baseColor") ? coldVec3(sample("baseColor").rgb) : null;
     m.normalNode = present.has("normal") ? coldVec3(shadingNormal) : null;
-    // Roughness/metalness only exist on Standard-derived families.
+    // Roughness/metalness only exist on Standard-derived families. A packed-ARM bake carries roughness in G
+    // and metalness in B of the shared arm texture (AO stays R, below); an unpacked bake is a grey broadcast
+    // read from R. The pack flag is folded into the presence signature, so a toggle re-runs this wiring.
+    const packed = this.set.packedFields;
     if (caps.roughMetal) {
-      m.roughnessNode = present.has("roughness") ? coldScalar(sample("roughness").r) : null;
-      m.metalnessNode = present.has("metallic") ? coldScalar(sample("metallic").r) : null;
+      m.roughnessNode = present.has("roughness")
+        ? coldScalar(packed ? sample("roughness").g : sample("roughness").r)
+        : null;
+      m.metalnessNode = present.has("metallic")
+        ? coldScalar(packed ? sample("metallic").b : sample("metallic").r)
+        : null;
     }
     if (caps.ao) {
       const vAo = attribute("vertexAo", "float");

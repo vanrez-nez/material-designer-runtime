@@ -4,6 +4,7 @@ import { MaterialGraphSession } from "./document";
 import { MaterialBakeService, SURFACE_CHANNELS, bakeService } from "./graph/bake-service";
 import { TexturedSurface } from "./graph/textured-surface";
 import { buildMeshMaterial, type ChannelTextures } from "./graph/mesh-material";
+import { FIELD_CHANNELS } from "./graph/channel-baker";
 import { channelDataTexture } from "./graph/texture-transfer";
 import type { MaterialGraphDocument, PbrSocket } from "./graph/types";
 import { defaultRegistry, type NodeRegistry } from "./graph/registry";
@@ -14,6 +15,8 @@ import type { ShaderVariant } from "./graph/shader-variant";
 
 // Cache-hydrated channel textures. Satisfies ChannelTextures so it drops straight into buildMeshMaterial, and
 // adds the height map (not a lit channel, so not part of that interface) plus the disposal the caller owns.
+// From a packArm entry, `height` is the SAME packed ARMH texture as the field sockets with the height field
+// in its ALPHA (sample .a); from an unpacked entry it is the dedicated grey height map (sample .r).
 export interface CachedChannelTextures extends ChannelTextures {
   size: number;
   channels: PbrSocket[];
@@ -225,6 +228,19 @@ export class MaterialGraphRuntime {
     const map = new Map<PbrSocket, THREE.DataTexture>();
     let height: THREE.DataTexture | null = null;
     for (const texels of entry.textures) {
+      if (texels.channel === "arm") {
+        // A packArm bake stores ONE packed ARMH texel buffer. Hydrate it once and hand the SAME texture to
+        // every field socket the entry declares — mirroring the live path, and exactly what
+        // buildMeshMaterial's aoMap(R)/roughnessMap(G)/metalnessMap(B) reads expect. When the entry carries
+        // height it rides this buffer's ALPHA, so `height` is the same texture too — sample its .a (a
+        // dedicated height map is sampled .r).
+        const armTex = channelDataTexture(texels.bytes, entry.size, "arm");
+        for (const ch of entry.channels) {
+          if ((FIELD_CHANNELS as readonly string[]).includes(ch)) map.set(ch as PbrSocket, armTex);
+        }
+        if (entry.hasHeight) height = armTex;
+        continue;
+      }
       const tex = channelDataTexture(texels.bytes, entry.size, texels.channel);
       if (texels.channel === "height") height = tex;
       else map.set(texels.channel, tex);
@@ -235,8 +251,11 @@ export class MaterialGraphRuntime {
       height,
       get: (channel) => map.get(channel) ?? null,
       dispose: () => {
-        for (const tex of map.values()) tex.dispose();
-        height?.dispose();
+        // The packed arm texture is mapped under several sockets (and possibly the height slot) — dedupe so
+        // it's disposed exactly once.
+        const all = new Set<THREE.DataTexture>(map.values());
+        if (height) all.add(height);
+        for (const tex of all) tex.dispose();
         map.clear();
         height = null;
       },

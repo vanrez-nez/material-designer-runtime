@@ -7,7 +7,9 @@ import type { MaterialGraphDocument } from "../graph/types";
 import type { BakeCacheChannel } from "./types";
 
 // Record SHAPE. Bump when BakeCacheEntry's fields change in a way an older/newer build would misread.
-export const BAKE_CACHE_VERSION = 1;
+// v2: `textures` may carry the packed "arm" (ARMH) pseudo-channel in place of the three field channels and
+// the height target — height then rides the arm alpha, flagged only by `hasHeight`.
+export const BAKE_CACHE_VERSION = 2;
 
 // The bake-OUTPUT convention. Bump this whenever the same document would produce different texels:
 //   - SS (channel-baker.ts) or downsampleNode's filter

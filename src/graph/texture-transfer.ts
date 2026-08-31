@@ -132,7 +132,7 @@ export function disposeTransferPool(): void {
 export function channelDataTexture(
   texels: Uint8Array,
   size: number,
-  channel: PbrSocket | "height",
+  channel: PbrSocket | "height" | "arm",
 ): THREE.DataTexture {
   const data = flipRows(texels, size, size);
   const tex = new THREE.DataTexture(data, size, size, THREE.RGBAFormat, THREE.UnsignedByteType);

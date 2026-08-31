@@ -131,6 +131,24 @@ describe("bake cache key", () => {
     expect(keyFor(doc).id).not.toBe(before.id);
   });
 
+  // packArm on vs off must key differently, or a pack toggle could restore texels baked in the other
+  // texture layout.
+  it("keys packArm distinctly so a pack toggle can't restore the other layout", () => {
+    const sparse = tweakableDoc(); // no packArm on the output node — packing defaults ON
+    const off = tweakableDoc();
+    off.nodes[3]!.params.packArm = false;
+    expect(keyFor(off).id).not.toBe(keyFor(sparse).id);
+    // The effective-param half of the key merges the registry default, so sparse ≡ explicit true there.
+    // (The topology half keys structural params RAW — the pre-existing convention for every bool/select —
+    // so the full key treats sparse and explicit-default as distinct bakes; a one-time miss, never a wrong
+    // restore.)
+    const explicitOn = tweakableDoc();
+    explicitOn.nodes[3]!.params.packArm = true;
+    expect(createMaterialParamKey(explicitOn, defaultRegistry)).toBe(
+      createMaterialParamKey(sparse, defaultRegistry),
+    );
+  });
+
   // Sparse params are the norm — ctx.constant falls back to the ParamDef default — so an unset param and an
   // explicitly-default one bake identically and must share a key, or the cache misses on equivalent documents.
   it("treats an unset param as its registry default", () => {
