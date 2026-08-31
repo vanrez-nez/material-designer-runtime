@@ -98,10 +98,46 @@ const mesh = new Mesh(geometry, material);
 // Keep `set` alive while the material is in use — set.dispose() frees the render targets (and the textures).
 ```
 
-`height` is baked separately (`set.heightTarget?.texture`). To read a channel back as CPU pixels
-for PNG export, use `bakeService.readImage(session, channel, 1024)` → `ImageData` (size must be a
-multiple of 64). If you keep a live `MaterialGraphRuntime`, the same baked textures are also
-reachable via `runtime.surface.getChannelTexture(channel)` and `runtime.surface.getHeightTexture()`.
+`height` is not a lit channel and has no material slot — read it via `set.heightTexture()` (see the
+packing note below for which component holds it). To read a channel back as CPU pixels for PNG
+export, use `bakeService.readImage(session, channel, 1024)` → `ImageData` (size must be a multiple
+of 64). If you keep a live `MaterialGraphRuntime`, the same baked textures are also reachable via
+`runtime.surface.getChannelTexture(channel)` and `runtime.surface.getHeightTexture()`.
+
+### Packed ARMH textures (default on)
+
+The Material Output node has a **`packArm`** param (bool, **default true** — documents store params
+sparsely, so every existing document opts in). With it on, a bake renders AO, roughness, metalness
+and height into **one** shared texture instead of one target each:
+
+| lane | field |
+| --- | --- |
+| R | ambient occlusion |
+| G | roughness |
+| B | metalness |
+| A | height (when the graph drives height; 1 otherwise) |
+
+R/G/B is three.js's native convention — the standard material samples `aoMap` from R, `roughnessMap`
+from G and `metalnessMap` from B — so the "bring your own material" example above is already correct
+in **both** modes: packed, the three assignments receive the *same* texture object and each slot reads
+its own lane; unpacked, each channel is a grey broadcast (r = g = b), so the same reads land on the
+same values. `getNodeMaterial()` / `getMeshMaterial()` handle the mode automatically (the node
+material's parallax reads the height from the alpha when packed).
+
+What changes for you:
+
+- **Queries return one shared object.** `set.texture("roughness")`, `set.texture("metallic")`,
+  `set.texture("ambientOcclusion")` and `set.heightTexture()` are all the same `THREE.Texture` when
+  packed. A socket that isn't connected in the graph still returns `null`, exactly as unpacked.
+- **Custom shaders must pick the right lane.** Packed: AO = `.r`, roughness = `.g`, metalness = `.b`,
+  height = `.a`. Unpacked: everything is grey — read `.r` (height included, from its own map).
+- **It's cheaper.** Up to four render targets and bake passes collapse into one, and a cached entry
+  stores one buffer where an unpacked bake stores four.
+
+Turn it off per document by setting `packArm: false` on the `material-output` node (or
+`runtime.setNodeParam(outputNodeId, "packArm", false)`) — the bake then produces the classic
+one-grey-texture-per-channel layout. The param is structural, so toggling re-bakes on its own, and it
+is part of the cache identity, so a toggle can never restore textures baked in the other layout.
 
 ## Opt-in profiling
 
@@ -221,6 +257,10 @@ stored size can't be known. Size it against raw totals:
 PNG typically shrinks that by 10× or more, so if you set `maxEntryBytes` to the on-disk figure you have in
 mind, larger materials will silently stop being cached.
 
+The 7-channel column is the **unpacked** worst case. With ARMH packing on (the default), AO, roughness,
+metalness and height ship as one buffer, so a full bake is typically 4 buffers — size the knobs against
+the layout your documents actually use.
+
 ### What a capture costs
 
 The readback is the one part that runs on the main thread. Measured on an M-series Mac in Chrome, per
@@ -273,6 +313,11 @@ if (cached) {
   // …you own these textures: cached.dispose() when the material is done with them.
 }
 ```
+
+From a packed (ARMH) entry, `cached.get("roughness"/"metallic"/"ambientOcclusion")` and
+`cached.height` all hand back the **same** hydrated texture — the lane conventions above apply, and
+`buildMeshMaterial` already reads the right ones. `dispose()` dedupes, so the shared texture is freed
+exactly once.
 
 ### Notes
 
