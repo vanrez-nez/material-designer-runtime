@@ -1,9 +1,10 @@
 import * as THREE from "three";
 import type { NodeMaterial } from "three/webgpu";
-import { uniform, vec3, normalWorld, texture, normalMap, float, attribute, uv } from "three/tsl";
+import { uniform, vec3, normalWorld, texture, normalMap, float, uv } from "three/tsl";
 import { compileGraph, newSurfaceMaterial, readMaterialSurface, readOutputResolution } from "./compiler";
 import { triplanarColor } from "../tsl/triplanar";
-import { triplanarNormalMap } from "../tsl/triplanar-normal";
+import { triplanarNormalMap, worldNormalToView } from "../tsl/triplanar-normal";
+import { vertexAo } from "../tsl/vertex-ao";
 import { parallaxOcclusionUV } from "../tsl/parallax";
 import {
   MATERIAL_TYPE_CAPS,
@@ -233,10 +234,13 @@ export class TexturedSurface {
     this.debugNormals = on;
     this.wire(this.lastPresent);
   }
-  // Internal/debug-only backend switch — the procedural "live" backend is NOT exposed by the public
-  // MaterialGraphRuntime facade (consumers always get the baked "offline" surface). Kept here so the live
-  // compile path (startup fallback + debugging) stays reachable via `runtime.surface`.
+  // Backend switch. Only the baked "offline" backend is supported for now; the procedural "live" backend is
+  // planned but not ready, so selecting it throws. The live compile code stays in place (it also serves as
+  // the pre-renderer startup fallback) so the backend can be enabled here later.
   setBackend(backend: MaterialBackend): void {
+    if (backend === "live") {
+      throw new Error('MaterialGraphRuntime: the "live" backend is not supported yet; use "offline".');
+    }
     if (backend === this.backend) return;
     this.backend = backend;
     void this.rebuild();
@@ -508,7 +512,11 @@ export class TexturedSurface {
     }
     // Common channels — every family lights these.
     m.colorNode = present.has("baseColor") ? coldVec3(sample("baseColor").rgb) : null;
-    m.normalNode = present.has("normal") ? coldVec3(shadingNormal) : null;
+    // normalNode is read as the VIEW-space normal. The UV path's normalMap() is already view-space; the
+    // triplanar sampler returns world space (kept for the debug view above), so convert it here.
+    m.normalNode = present.has("normal")
+      ? coldVec3(this.triplanar ? worldNormalToView(shadingNormal) : shadingNormal)
+      : null;
     // Roughness/metalness only exist on Standard-derived families. A packed-ARM bake carries roughness in G
     // and metalness in B of the shared arm texture (AO stays R, below); an unpacked bake is a grey broadcast
     // read from R. The pack flag is folded into the presence signature, so a toggle re-runs this wiring.
@@ -522,7 +530,7 @@ export class TexturedSurface {
         : null;
     }
     if (caps.ao) {
-      const vAo = attribute("vertexAo", "float");
+      const vAo = vertexAo();
       m.aoNode = coldScalar(present.has("ambientOcclusion") ? sample("ambientOcclusion").r.mul(vAo) : vAo);
     }
     if (caps.emissive) m.emissiveNode = present.has("emission") ? coldVec3(sample("emission").rgb) : null;

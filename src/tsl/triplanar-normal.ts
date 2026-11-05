@@ -1,4 +1,4 @@
-import { Fn, vec3, texture, positionWorld, normalWorld } from "three/tsl";
+import { Fn, vec3, vec4, texture, positionWorld, normalWorld, cameraViewMatrix } from "three/tsl";
 import type { Texture } from "three/webgpu";
 import type { MaterialValue } from "../graph/types";
 import { triplanarBlendWeights } from "./triplanar";
@@ -11,6 +11,9 @@ import { triplanarBlendWeights } from "./triplanar";
 // For a decoded tangent normal n = (u, v, up): X-plane → world n.zxy, Y-plane → world n.yzx, Z-plane → n.xyz.
 // The `up` component is flipped by the sign of the geometry world normal so back-facing planes don't invert.
 // Weights are |worldNormal| normalized, same as triplanarTexture.
+//
+// Returns a WORLD-space normal (what the debug-normals view wants). three's `material.normalNode` is read as
+// the VIEW-space normal, so wrap the result in `worldNormalToView` before assigning it there.
 type V = MaterialValue;
 
 export function triplanarNormalMap(map: Texture, scale: V, sharpness: V): V {
@@ -35,4 +38,10 @@ export function triplanarNormalMap(map: Texture, scale: V, sharpness: V): V {
       .add(NZ.xyz.mul(bf.z));
     return world.normalize();
   })();
+}
+
+// World-space direction → view-space, for `material.normalNode` (consumed as normalView). The view matrix is
+// rigid, so a unit normal stays unit length.
+export function worldNormalToView(n: V): V {
+  return cameraViewMatrix.mul(vec4(n, 0)).xyz;
 }

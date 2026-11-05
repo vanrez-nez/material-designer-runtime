@@ -26,7 +26,8 @@ config by hand. Pick based on what you need:
 
 - **`getNodeMaterial()`** — the TSL node material (`MeshStandardNodeMaterial`, `MeshPhysicalNodeMaterial`, …)
   with full procedural fidelity: triplanar projection, parallax-occlusion, per-vertex AO, and
-  procedurally-driven lobes. WebGPU only.
+  procedurally-driven lobes. WebGPU only. Per-vertex AO is optional: if the geometry has a float
+  `vertexAo` attribute (0–1), it multiplies the AO; geometries without it are treated as fully unoccluded.
 - **`getMeshMaterial()`** — a plain Three.js material (`MeshStandardMaterial`, `MeshPhysicalMaterial`,
   `MeshLambertMaterial`, `MeshToonMaterial`, `MeshPhongMaterial`, `MeshMatcapMaterial`) with the baked
   maps in the standard slots. Drops the node-only features above.

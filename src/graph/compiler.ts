@@ -8,7 +8,7 @@ import {
   MeshMatcapNodeMaterial,
   type NodeMaterial,
 } from "three/webgpu";
-import { positionWorld, uv, vec3, float, uniform, uniformArray, luminance, attribute, texture } from "three/tsl";
+import { positionWorld, uv, vec3, float, uniform, uniformArray, luminance, texture } from "three/tsl";
 import {
   GROUP_INPUT_TYPE,
   GROUP_OUTPUT_TYPE,
@@ -35,6 +35,7 @@ import {
 } from "./types";
 import { nodePorts, type NodeRegistry } from "./registry";
 import { gradientMapFor, matcapFor } from "./material-textures";
+import { vertexAo } from "../tsl/vertex-ao";
 
 // Re-exported so consumers importing from the compiler keep working; the source of truth is material-textures.
 export { gradientMapFor, matcapFor };
@@ -743,11 +744,11 @@ export function applyBundle(material: NodeMaterial, bundle: MaterialBundle, type
     m.transparent = true;
   }
   // AO modulates only the indirect/IBL term. Compose the mesh's per-vertex FORM AO (to-buffer-geometry's
-  // `vertexAo`, geometry-driven) with the graph's texture-scale DETAIL AO when connected — same as the
+  // `vertexAo`, geometry-driven, optional) with the graph's texture-scale DETAIL AO when connected — same as the
   // offline backend's bakedAO × vertexAo. Skipped entirely for unlit Matcap (no aoNode).
   if (caps.ao) {
-    const vertexAo = attribute("vertexAo", "float");
-    m.aoNode = bundle.ambientOcclusion ? bundle.ambientOcclusion.mul(vertexAo) : vertexAo;
+    const vAo = vertexAo(); // 1 when the geometry has no `vertexAo` attribute
+    m.aoNode = bundle.ambientOcclusion ? bundle.ambientOcclusion.mul(vAo) : vAo;
   }
   if (caps.emissive && bundle.emission) m.emissiveNode = bundle.emission;
   if (caps.roughMetal) {
